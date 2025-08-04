@@ -13,7 +13,7 @@ from tqdm import tqdm
 from prompt_toolkit import prompt
 from prompt_toolkit.completion import WordCompleter
 
-CONFIG_FILE = "config.ini"
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
 
 class GiteeClient:
     def __init__(self, base_url, token):
@@ -43,12 +43,14 @@ class GiteeClient:
             return []
         return [label['name'] for label in r.json()]
 
-    def create_issue(self, owner, repo, title, body, labels=[]):
-        url = f"{self.base_url}/api/v5/repos/{owner}/{repo}/issues"
+    def create_issue(self, owner, repo, title, body, labels=None):
+        if labels is None:
+            labels = []
+        url = f"{self.base_url}/api/v5/repos/{owner}/issues"
         data = {
             "title": title,
             "body": body,
-            "labels": ''.join(labels),
+            "labels": ', '.join(labels),
             "repo": repo
         }
         r = self.session.post(url, json=data)
@@ -105,14 +107,28 @@ class GiteeClient:
 
 
 def detect_git_repo():
+    import subprocess
+    import os
     try:
-        repo_url = subprocess.check_output(["git", "remote", "get-url", "origin"], stderr=subprocess.DEVNULL).decode().strip()
-        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
-        if "gitee.com" in repo_url:
-            owner_repo = repo_url.split(":")[-1].replace(".git", "")
-            owner, repo = owner_repo.split("/")
-            return owner, repo, branch
-    except:
+        url = subprocess.check_output(
+            ['git', 'config', '--get', 'remote.origin.url'],
+            stderr=subprocess.DEVNULL,
+            text=True
+        ).strip()
+        branch = subprocess.check_output(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            stderr=subprocess.DEVNULL,
+            text=True
+        ).strip()
+
+        # Пример url: https://gitee.com/mazurdenis/gitee_utils.git
+        if url.endswith('.git'):
+            url = url[:-4]
+        parts = url.split('/')[-2:]
+        owner, repo = parts[0], parts[1]
+
+        return owner, repo, branch
+    except Exception:
         return None, None, None
 
 
@@ -151,6 +167,220 @@ def load_config():
     return base_url, token
 
 
+def handle_create_issue(args, client):
+    owner, repo = args.repo.split("/")
+
+    if not client.validate_repository(owner, repo):
+        print(f"❌ Repository {owner}/{repo} not found or inaccessible.")
+        return
+
+    templates = client.get_issue_templates(owner, repo)
+    path = None
+    for t in templates:
+        if args.type in t['name']:
+            path = t['path']
+            break
+    template = client.get_template_content(owner, repo, path) if path else ""
+
+    if args.desc_file:
+        with open(args.desc_file, 'r', encoding='utf-8') as f:
+            body = f.read()
+    else:
+        if template:
+            body = interactive_issue_input(template)
+        else:
+            print("⚠️ No issue template found. Please provide description manually.")
+            body = prompt("Issue Description > ")
+
+    title = args.title or prompt("Issue Title > ")
+
+    existing_labels = client.get_labels(owner, repo)
+    wanted_label = "bug" if args.type == "bug" else "enhancement"
+    label = next((lbl for lbl in existing_labels if lbl.lower() == wanted_label), None)
+    labels = [label] if label else []
+
+    result = client.create_issue(owner, repo, title, body, labels)
+    print("✅ Issue created:", result['html_url'])
+
+
+def handle_create_pr(args, client):
+    src_owner, src_repo, src_branch = detect_git_repo()
+    if not src_owner or not src_repo:
+        repo_input = prompt("Repository (owner/repo) > ")
+        src_owner, src_repo = repo_input.split("/")
+    if not src_branch:
+        src_branch = prompt("Current branch (source) > ")
+    base = args.base or prompt("Target base branch (e.g. master) > ")
+
+    if not args.repo:
+        tgt_repo = prompt(" Target repository (owner/repo) > ")
+    else:
+        tgt_repo = args.repo
+    tgt_owner, tgt_repo = tgt_repo.split("/")
+
+    if not client.validate_repository(tgt_owner, tgt_repo):
+        print(f"❌ Target repository {tgt_owner}/{tgt_repo} not found or inaccessible.")
+        return
+
+    if not client.validate_branch_exists(tgt_owner, tgt_repo, base):
+        print(f"❌ Target branch '{base}' does not exist.")
+        return
+
+    if args.desc_file:
+        with open(args.desc_file, 'r', encoding='utf-8') as f:
+            pr_body = f.read()
+    else:
+        try:
+            import subprocess
+            pr_body = subprocess.check_output(["git", "log", "-1", "--pretty=%B"], text=True).strip()
+            if not pr_body:
+                pr_body = prompt("PR Description > ")
+            else:
+                print("ℹ️ Using last commit message as PR description.")
+        except Exception:
+            pr_body = prompt("PR Description > ")
+    title = pr_body.splitlines()[0] if pr_body else prompt("PR Title > ")
+
+    head = f"{src_owner}/{src_repo}:{src_branch}"
+
+    print("Creating PR with the following info:")
+    print(f"Source repo: {src_owner}/{src_repo}")
+    print(f"From branch: {src_branch} (head = {head})")
+    print(f"Target repo: {tgt_owner}/{tgt_repo}")
+    print(f"To branch: {base}")
+    print(f"Title: {title}")
+    confirm = prompt("Proceed? (yes/no) > ")
+    if confirm.lower() == "yes":
+        result = client.create_pull_request(tgt_owner, tgt_repo, title, pr_body, head, base)
+        print("✅ PR created:", result['html_url'])
+
+
+def handle_comment_pr(args, client):
+    import re
+
+    owner = repo = pr_id = None
+
+    if args.url:
+        match = re.match(r"https://gitee.com/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
+        if match:
+            owner, repo, pr_id = match.groups()
+        else:
+            print("❌ Invalid pull request URL format.")
+            return
+    elif args.repo and args.pr_id:
+        owner, repo = args.repo.split("/")
+        pr_id = args.pr_id
+    else:
+        input_val = prompt("Enter pull request URL or owner/repo > ")
+        if input_val.startswith("http"):
+            match = re.match(r"https://gitee.com/([^/]+)/([^/]+)/pulls/(\d+)", input_val)
+            if match:
+                owner, repo, pr_id = match.groups()
+            else:
+                print("❌ Invalid pull request URL format.")
+                return
+        elif "/" in input_val:
+            owner, repo = input_val.split("/")
+            pr_id = prompt("Enter pull request ID > ")
+        else:
+            print("❌ Invalid input. Expected a URL or owner/repo format.")
+            return
+
+    comment = args.comment or prompt("Comment > ")
+    result = client.comment_pull_request(owner, repo, pr_id, comment)
+    print("✅ Comment added:", result.get("html_url", ""))
+
+
+def handle_list_pr(args, client):
+    repos = args.repos.split(",") if args.repos else []
+    user = args.user or prompt("Username > ")
+    state = args.state
+    for repo_full in repos:
+        owner, repo = repo_full.split("/")
+        print(f"\n📂 {repo_full}")
+        prs = client.list_pull_requests(owner, repo, state, user)
+        for pr in tqdm(prs, desc=f"{repo}", ncols=100):
+            print(f"- #{pr['number']} {pr['title']} [{pr['state']}] {pr['html_url']}")
+
+
+def handle_create_issue_and_pr(args, client):
+    owner, repo = args.repo.split("/")
+    if not client.validate_repository(owner, repo):
+        print(f"❌ Repository {owner}/{repo} not found or inaccessible.")
+        return
+
+    templates = client.get_issue_templates(owner, repo)
+    path = next((t['path'] for t in templates if args.type in t['name']), None)
+    template = client.get_template_content(owner, repo, path) if path else ""
+
+    if args.desc_file:
+        with open(args.desc_file, 'r', encoding='utf-8') as f:
+            issue_body = f.read()
+    else:
+        issue_body = interactive_issue_input(template) if template else prompt("Issue Description > ")
+
+    issue_title = args.title or prompt("Issue Title > ")
+
+    existing_labels = client.get_labels(owner, repo)
+    wanted_label = "bug" if args.type == "bug" else "enhancement"
+    label = next((lbl for lbl in existing_labels if lbl.lower() == wanted_label), None)
+    labels = [label] if label else []
+
+    issue_result = client.create_issue(owner, repo, issue_title, issue_body, labels)
+    issue_url = issue_result['html_url']
+    print("✅ Issue created:", issue_url)
+
+    # --- PR part ---
+    owner, repo, branch = detect_git_repo()
+    base = args.base or prompt("Target base branch (e.g. master) > ")
+
+    if branch == base:
+        print("❌ Cannot create PR from the same branch to itself.")
+        return
+
+    if args.desc_file:
+        with open(args.desc_file, 'r', encoding='utf-8') as f:
+            pr_body = f.read()
+    else:
+        try:
+            import subprocess
+            pr_body = subprocess.check_output(["git", "log", "-1", "--pretty=%B"], text=True).strip()
+            if not pr_body:
+                pr_body = prompt("PR Description > ")
+            else:
+                print("ℹ️ Using last commit message as PR description.")
+        except Exception:
+            pr_body = prompt("PR Description > ")
+
+    lines = pr_body.splitlines()
+    for idx, line in enumerate(lines):
+        if line.strip().startswith("IssueNo:"):
+            if 'http' not in line:
+                lines[idx] = f"{line.strip()} ({issue_url})"
+            else:
+                confirm = prompt("Replace existing IssueNo link with new one? (yes/no) > ")
+                if confirm.lower() == "yes":
+                    lines[idx] = f"IssueNo: {issue_url}"
+            break
+    else:
+        lines.insert(0, f"IssueNo: {issue_url}")
+
+    pr_body = "\n".join(lines)
+    pr_title = pr_body.splitlines()[0] if pr_body else prompt("PR Title > ")
+    head = f"{owner}:{branch}"
+
+    print("Creating PR with the following info:")
+    print(f"Source repo: {owner}/{repo}")
+    print(f"From branch: {branch} (head = {head})")
+    print(f"Target repo: {owner}/{repo}")
+    print(f"To branch: {base}")
+    print(f"Title: {pr_title}")
+    confirm = prompt("Proceed? (yes/no) > ")
+    if confirm.lower() == "yes":
+        pr_result = client.create_pull_request(owner, repo, pr_title, pr_body, head, base)
+        print("✅ PR created:", pr_result['html_url'])
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gitee Utility Tool")
     subparsers = parser.add_subparsers(dest="command")
@@ -167,8 +397,9 @@ def main():
     p_pr.add_argument("--desc-file")
 
     p_cmt = subparsers.add_parser("comment-pr")
-    p_cmt.add_argument("--repo", required=True)
-    p_cmt.add_argument("--pr-id")
+    p_cmt.add_argument("--repo")  # required=False
+    p_cmt.add_argument("--pr-id")  # required=False
+    p_cmt.add_argument("--url")  # новый аргумент
     p_cmt.add_argument("--comment")
 
     p_list = subparsers.add_parser("list-pr")
@@ -176,104 +407,27 @@ def main():
     p_list.add_argument("--user")
     p_list.add_argument("--state", default="open")
 
+    p_both = subparsers.add_parser("create-issue-pr")
+    p_both.add_argument("--repo", required=True)
+    p_both.add_argument("--type", choices=["bug", "feature"], required=True)
+    p_both.add_argument("--title")
+    p_both.add_argument("--desc-file")
+    p_both.add_argument("--base")
+
     args = parser.parse_args()
     base_url, token = load_config()
     client = GiteeClient(base_url, token)
 
     if args.command == "create-issue":
-        owner, repo = args.repo.split("/")
-
-        if not client.validate_repository(owner, repo):
-            print(f"❌ Repository {owner}/{repo} not found or inaccessible.")
-            return
-
-        templates = client.get_issue_templates(owner, repo)
-        path = None
-        for t in templates:
-            if args.type in t['name']:
-                path = t['path']
-                break
-        template = client.get_template_content(owner, repo, path) if path else ""
-        if args.desc_file:
-            with open(args.desc_file, 'r', encoding='utf-8') as f:
-                body = f.read()
-        else:
-            if template:
-                body = interactive_issue_input(template)
-            else:
-                print("⚠️ No issue template found. Please provide description manually.")
-                body = prompt("Issue Description > ")
-        title = args.title or prompt("Issue Title > ")
-
-        existing_labels = client.get_labels(owner, repo)
-        wanted_label = "bug" if args.type == "bug" else "enhancement"
-        label = next((lbl for lbl in existing_labels if lbl.lower() == wanted_label), None)
-        labels = [label] if label else []
-
-        result = client.create_issue(owner, repo, title, body, labels)
-        print("✅ Issue created:", result['html_url'])
-
+        handle_create_issue(args, client)
     elif args.command == "create-pr":
-        owner, repo, branch = detect_git_repo()
-        if not owner:
-            repo_input = args.repo or prompt("Repository (owner/repo) > ")
-            owner, repo = repo_input.split("/")
-            branch = prompt("Current branch > ")
-        base = args.base or prompt("Base branch > ")
-
-        if not client.validate_repository(owner, repo):
-            print(f"❌ Repository {owner}/{repo} not found or inaccessible.")
-            return
-
-        if not client.validate_branch_exists(owner, repo, base):
-            print(f"❌ Target branch '{base}' does not exist.")
-            return
-
-        if args.desc_file:
-            with open(args.desc_file, 'r', encoding='utf-8') as f:
-                body = f.read()
-        else:
-            body = prompt("PR Description > ")
-        title = body.splitlines()[0] if body else prompt("PR Title > ")
-
-        if not title.strip():
-            print("❌ Title cannot be empty.")
-            return
-
-        if not body.strip():
-            confirm_empty = prompt("⚠️ Body is empty. Continue anyway? (yes/no) > ")
-            if confirm_empty.lower() != "yes":
-                return
-
-        print("Creating PR with the following info:")
-        print("From branch:", branch)
-        print("To branch:", base)
-        print("Title:", title)
-        confirm = prompt("Proceed? (yes/no) > ")
-        if confirm.lower() == "yes":
-            # get fork_owner from `git config --get remote.origin.url`
-            fork_owner = owner  # или вычислить, если нужно
-            head = f"{fork_owner}:{branch}"
-            result = client.create_pull_request(owner, repo, title, body, head, base)
-            print("✅ PR created:", result['html_url'])
-
+        handle_create_pr(args, client)
     elif args.command == "comment-pr":
-        owner, repo = args.repo.split("/")
-        pr_id = args.pr_id or prompt("Pull Request ID > ")
-        comment = args.comment or prompt("Comment > ")
-        result = client.comment_pull_request(owner, repo, pr_id, comment)
-        print("✅ Comment added.")
-
+        handle_comment_pr(args, client)
     elif args.command == "list-pr":
-        repos = args.repos.split(",") if args.repos else []
-        user = args.user or prompt("Username > ")
-        state = args.state
-        for repo_full in repos:
-            owner, repo = repo_full.split("/")
-            print(f"\n📂 {repo_full}")
-            prs = client.list_pull_requests(owner, repo, state, user)
-            for pr in tqdm(prs, desc=f"{repo}", ncols=100):
-                print(f"- #{pr['number']} {pr['title']} [{pr['state']}] {pr['html_url']}")
+        handle_list_pr(args, client)
+    elif args.command == "create-issue-pr":
+        handle_create_issue_and_pr(args, client)
 
 if __name__ == "__main__":
     main()
