@@ -201,9 +201,10 @@ def handle_create_issue(args, client):
 
     result = client.create_issue(owner, repo, title, body, labels)
     print("✅ Issue created:", result['html_url'])
+    return result['html_url']
 
 
-def handle_create_pr(args, client):
+def handle_create_pr(args, client, issue_url=None):
     src_owner, src_repo, src_branch = detect_git_repo()
     if not src_owner or not src_repo:
         repo_input = prompt("Repository (owner/repo) > ")
@@ -213,10 +214,10 @@ def handle_create_pr(args, client):
     base = args.base or prompt("Target base branch (e.g. master) > ")
 
     if not args.repo:
-        tgt_repo = prompt(" Target repository (owner/repo) > ")
+        tgt_repo_input = prompt("Target repository (owner/repo) > ")
     else:
-        tgt_repo = args.repo
-    tgt_owner, tgt_repo = tgt_repo.split("/")
+        tgt_repo_input = args.repo
+    tgt_owner, tgt_repo = tgt_repo_input.split("/")
 
     if not client.validate_repository(tgt_owner, tgt_repo):
         print(f"❌ Target repository {tgt_owner}/{tgt_repo} not found or inaccessible.")
@@ -239,8 +240,23 @@ def handle_create_pr(args, client):
                 print("ℹ️ Using last commit message as PR description.")
         except Exception:
             pr_body = prompt("PR Description > ")
-    title = pr_body.splitlines()[0] if pr_body else prompt("PR Title > ")
 
+    if issue_url:
+        lines = pr_body.splitlines()
+        for idx, line in enumerate(lines):
+            if line.strip().startswith("IssueNo:"):
+                if 'http' not in line:
+                    lines[idx] = f"{line.strip()} ({issue_url})"
+                else:
+                    confirm = prompt("Replace existing IssueNo link with new one? (yes/no) > ")
+                    if confirm.lower() == "yes":
+                        lines[idx] = f"IssueNo: {issue_url}"
+                break
+        else:
+            lines.insert(0, f"IssueNo: {issue_url}")
+        pr_body = "\n".join(lines)
+
+    title = pr_body.splitlines()[0] if pr_body else prompt("PR Title > ")
     head = f"{src_owner}/{src_repo}:{src_branch}"
 
     print("Creating PR with the following info:")
@@ -304,81 +320,9 @@ def handle_list_pr(args, client):
 
 
 def handle_create_issue_and_pr(args, client):
-    owner, repo = args.repo.split("/")
-    if not client.validate_repository(owner, repo):
-        print(f"❌ Repository {owner}/{repo} not found or inaccessible.")
-        return
-
-    templates = client.get_issue_templates(owner, repo)
-    path = next((t['path'] for t in templates if args.type in t['name']), None)
-    template = client.get_template_content(owner, repo, path) if path else ""
-
-    if args.desc_file:
-        with open(args.desc_file, 'r', encoding='utf-8') as f:
-            issue_body = f.read()
-    else:
-        issue_body = interactive_issue_input(template) if template else prompt("Issue Description > ")
-
-    issue_title = args.title or prompt("Issue Title > ")
-
-    existing_labels = client.get_labels(owner, repo)
-    wanted_label = "bug" if args.type == "bug" else "enhancement"
-    label = next((lbl for lbl in existing_labels if lbl.lower() == wanted_label), None)
-    labels = [label] if label else []
-
-    issue_result = client.create_issue(owner, repo, issue_title, issue_body, labels)
-    issue_url = issue_result['html_url']
-    print("✅ Issue created:", issue_url)
-
-    # --- PR part ---
-    owner, repo, branch = detect_git_repo()
-    base = args.base or prompt("Target base branch (e.g. master) > ")
-
-    if branch == base:
-        print("❌ Cannot create PR from the same branch to itself.")
-        return
-
-    if args.desc_file:
-        with open(args.desc_file, 'r', encoding='utf-8') as f:
-            pr_body = f.read()
-    else:
-        try:
-            import subprocess
-            pr_body = subprocess.check_output(["git", "log", "-1", "--pretty=%B"], text=True).strip()
-            if not pr_body:
-                pr_body = prompt("PR Description > ")
-            else:
-                print("ℹ️ Using last commit message as PR description.")
-        except Exception:
-            pr_body = prompt("PR Description > ")
-
-    lines = pr_body.splitlines()
-    for idx, line in enumerate(lines):
-        if line.strip().startswith("IssueNo:"):
-            if 'http' not in line:
-                lines[idx] = f"{line.strip()} ({issue_url})"
-            else:
-                confirm = prompt("Replace existing IssueNo link with new one? (yes/no) > ")
-                if confirm.lower() == "yes":
-                    lines[idx] = f"IssueNo: {issue_url}"
-            break
-    else:
-        lines.insert(0, f"IssueNo: {issue_url}")
-
-    pr_body = "\n".join(lines)
-    pr_title = pr_body.splitlines()[0] if pr_body else prompt("PR Title > ")
-    head = f"{owner}:{branch}"
-
-    print("Creating PR with the following info:")
-    print(f"Source repo: {owner}/{repo}")
-    print(f"From branch: {branch} (head = {head})")
-    print(f"Target repo: {owner}/{repo}")
-    print(f"To branch: {base}")
-    print(f"Title: {pr_title}")
-    confirm = prompt("Proceed? (yes/no) > ")
-    if confirm.lower() == "yes":
-        pr_result = client.create_pull_request(owner, repo, pr_title, pr_body, head, base)
-        print("✅ PR created:", pr_result['html_url'])
+    issue_url = handle_create_issue(args, client)
+    if issue_url:
+        handle_create_pr(args, client, issue_url)
 
 
 def main():
@@ -397,9 +341,9 @@ def main():
     p_pr.add_argument("--desc-file")
 
     p_cmt = subparsers.add_parser("comment-pr")
-    p_cmt.add_argument("--repo")  # required=False
-    p_cmt.add_argument("--pr-id")  # required=False
-    p_cmt.add_argument("--url")  # новый аргумент
+    p_cmt.add_argument("--repo")
+    p_cmt.add_argument("--pr-id")
+    p_cmt.add_argument("--url")
     p_cmt.add_argument("--comment")
 
     p_list = subparsers.add_parser("list-pr")
