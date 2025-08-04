@@ -12,6 +12,10 @@ from configparser import ConfigParser
 from tqdm import tqdm
 from prompt_toolkit import prompt
 from prompt_toolkit.completion import WordCompleter
+import re
+import html
+from prompt_toolkit import prompt
+from bs4 import BeautifulSoup
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
 
@@ -104,6 +108,12 @@ class GiteeClient:
         url = f"{self.base_url}/api/v5/repos/{owner}/{repo}/branches/{branch}"
         r = self.session.get(url)
         return r.ok
+
+    def get_pull_request_comments(self, owner, repo, pr_id):
+        url = f"{self.base_url}/api/v5/repos/{owner}/{repo}/pulls/{pr_id}/comments"
+        r = self.session.get(url)
+        r.raise_for_status()
+        return r.json()
 
 
 def detect_git_repo():
@@ -308,12 +318,31 @@ def handle_comment_pr(args, client):
 
 
 def handle_list_pr(args, client):
+    import subprocess
+
     repos = args.repos.split(",") if args.repos else []
-    user = args.user or prompt("Username > ")
-    state = args.state
+    if not repos:
+        owner, repo, _ = detect_git_repo()
+        if owner and repo:
+            current_repo = f"{owner}/{repo}"
+            user_input = prompt(f"Enter repositories to list PRs (comma-separated) [current: {current_repo}] > ")
+            repos = [user_input] if user_input else [current_repo]
+        else:
+            user_input = prompt("Enter repositories to list PRs (comma-separated) > ")
+            repos = user_input.split(",") if user_input else []
+
+    try:
+        default_user = subprocess.check_output(["git", "config", "user.name"], text=True).strip()
+    except Exception:
+        default_user = ""
+    user_input = prompt(f"Enter user for listing PRs (current: {default_user}) > ")
+    user = user_input or default_user
+
+    state = args.state or prompt("Enter PR state [open/closed/all] (default: open) > ") or "open"
+
     for repo_full in repos:
-        owner, repo = repo_full.split("/")
-        print(f"\n📂 {repo_full}")
+        owner, repo = repo_full.strip().split("/")
+        print(f"\n📂 {repo_full.strip()}")
         prs = client.list_pull_requests(owner, repo, state, user)
         for pr in tqdm(prs, desc=f"{repo}", ncols=100):
             print(f"- #{pr['number']} {pr['title']} [{pr['state']}] {pr['html_url']}")
@@ -323,6 +352,62 @@ def handle_create_issue_and_pr(args, client):
     issue_url = handle_create_issue(args, client)
     if issue_url:
         handle_create_pr(args, client, issue_url)
+
+
+def strip_html_tags(text):
+    """Удаляет html-теги и приводит к читаемому виду"""
+    text = html.unescape(text)
+    soup = BeautifulSoup(text, "html.parser")
+    return soup.get_text(separator="\n")
+
+
+def handle_show_comments(args, client):
+    owner = repo = pr_id = None
+
+    # Попробовать взять из аргументов
+    if args.url:
+        match = re.match(r"https://gitee\.com/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
+        if match:
+            owner, repo, pr_id = match.groups()
+        else:
+            print("❌ Invalid pull request URL format.")
+            return
+    elif args.repo and args.pr_id:
+        owner, repo = args.repo.split("/")
+        pr_id = args.pr_id
+    else:
+        # Интерактивный ввод
+        input_val = prompt("Enter pull request URL or owner/repo > ")
+        if input_val.startswith("http"):
+            match = re.match(r"https://gitee\.com/([^/]+)/([^/]+)/pulls/(\d+)", input_val)
+            if match:
+                owner, repo, pr_id = match.groups()
+            else:
+                print("❌ Invalid pull request URL format.")
+                return
+        elif "/" in input_val:
+            owner, repo = input_val.split("/")
+            pr_id = prompt("Enter pull request ID > ")
+        else:
+            print("❌ Invalid input. Expected a URL or owner/repo format.")
+            return
+
+    try:
+        comments = client.get_pull_request_comments(owner, repo, pr_id)
+        if not comments:
+            print("ℹ️ No comments found.")
+            return
+        print(f"\n💬 Comments for PR #{pr_id} in {owner}/{repo}:\n")
+        for c in comments:
+            author = c.get("user", {}).get("login", "unknown")
+            date = c.get("created_at", "N/A")
+            body = c.get("body", "")
+            plain = strip_html_tags(body).strip()
+            print(f"--- {author} @ {date} ---")
+            print(plain or "[empty]")
+            print()
+    except requests.exceptions.HTTPError as e:
+        print(f"❌ Failed to fetch comments: {e}")
 
 
 def main():
@@ -358,6 +443,11 @@ def main():
     p_both.add_argument("--desc-file")
     p_both.add_argument("--base")
 
+    p_show = subparsers.add_parser("show-comments")
+    p_show.add_argument("--url")
+    p_show.add_argument("--repo")
+    p_show.add_argument("--pr-id")
+
     args = parser.parse_args()
     base_url, token = load_config()
     client = GiteeClient(base_url, token)
@@ -372,6 +462,8 @@ def main():
         handle_list_pr(args, client)
     elif args.command == "create-issue-pr":
         handle_create_issue_and_pr(args, client)
+    elif args.command == "show-comments":
+        handle_show_comments(args, client)
 
 if __name__ == "__main__":
     main()
