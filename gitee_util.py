@@ -16,24 +16,35 @@ import re
 import html
 from prompt_toolkit import prompt
 from bs4 import BeautifulSoup
+from pathlib import Path
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
 
 class GiteeClient:
     def __init__(self, base_url, token):
-        self.base_url = base_url.rstrip('/')
+        self.api_base = f"{base_url}/api/v5"
         self.session = requests.Session()
-        self.session.headers.update({"Authorization": f"token {token}"})
+        self.session.params = {"access_token": token}
+        self._cache = {}  # 🔒 Кэш для шаблонов и других ресурсов
+
+    def safe_request(self, method, url, **kwargs):
+        try:
+            r = self.session.request(method, url, **kwargs)
+            r.raise_for_status()
+            return r
+        except requests.HTTPError as e:
+            print(f"❌ Gitee API error {r.status_code}: {r.text}")
+            return None
 
     def get_issue_templates(self, owner, repo):
-        url = f"{self.base_url}/api/v5/repos/{owner}/{repo}/contents/.gitee/ISSUE_TEMPLATE"
+        url = f"{self.api_base}/repos/{owner}/{repo}/contents/.gitee/ISSUE_TEMPLATE"
         r = self.session.get(url)
         if r.status_code != 200:
             return []
         return r.json()
 
     def get_template_content(self, owner, repo, path):
-        url = f"{self.base_url}/api/v5/repos/{owner}/{repo}/contents/{path}"
+        url = f"{self.api_base}/repos/{owner}/{repo}/contents/{path}"
         r = self.session.get(url)
         if r.status_code != 200:
             return None
@@ -41,7 +52,7 @@ class GiteeClient:
         return content
 
     def get_labels(self, owner, repo):
-        url = f"{self.base_url}/api/v5/repos/{owner}/{repo}/labels"
+        url = f"{self.api_base}/repos/{owner}/{repo}/labels"
         r = self.session.get(url)
         if r.status_code != 200:
             return []
@@ -50,7 +61,7 @@ class GiteeClient:
     def create_issue(self, owner, repo, title, body, labels=None):
         if labels is None:
             labels = []
-        url = f"{self.base_url}/api/v5/repos/{owner}/issues"
+        url = f"{self.api_base}/repos/{owner}/issues"
         data = {
             "title": title,
             "body": body,
@@ -64,7 +75,7 @@ class GiteeClient:
         return r.json()
 
     def create_pull_request(self, owner, repo, title, body, head, base):
-        url = f"{self.base_url}/api/v5/repos/{owner}/{repo}/pulls"
+        url = f"{self.api_base}/repos/{owner}/{repo}/pulls"
         data = {
             "title": title,
             "body": body or "",
@@ -81,7 +92,7 @@ class GiteeClient:
         return r.json()
 
     def list_pull_requests(self, owner, repo, state='open', author=None):
-        url = f"{self.base_url}/api/v5/repos/{owner}/{repo}/pulls?state={state}"
+        url = f"{self.api_base}/repos/{owner}/{repo}/pulls?state={state}"
         if author:
             url += f"&author={author}"
         r = self.session.get(url)
@@ -91,7 +102,7 @@ class GiteeClient:
         return r.json()
 
     def comment_pull_request(self, owner, repo, pr_number, comment):
-        url = f"{self.base_url}/api/v5/repos/{owner}/{repo}/pulls/{pr_number}/comments"
+        url = f"{self.api_base}/repos/{owner}/{repo}/pulls/{pr_number}/comments"
         data = {"body": comment}
         r = self.session.post(url, json=data)
         if not r.ok:
@@ -100,25 +111,42 @@ class GiteeClient:
         return r.json()
 
     def validate_repository(self, owner, repo):
-        url = f"{self.base_url}/api/v5/repos/{owner}/{repo}"
+        url = f"{self.api_base}/repos/{owner}/{repo}"
         r = self.session.get(url)
         return r.ok
 
     def validate_branch_exists(self, owner, repo, branch):
-        url = f"{self.base_url}/api/v5/repos/{owner}/{repo}/branches/{branch}"
+        url = f"{self.api_base}/repos/{owner}/{repo}/branches/{branch}"
         r = self.session.get(url)
         return r.ok
 
     def get_pull_request_comments(self, owner, repo, pr_id):
-        url = f"{self.base_url}/api/v5/repos/{owner}/{repo}/pulls/{pr_id}/comments"
+        url = f"{self.api_base}/repos/{owner}/{repo}/pulls/{pr_id}/comments"
         r = self.session.get(url)
         r.raise_for_status()
         return r.json()
 
 
+    def get_file_from_repo(self, owner, repo, path, ref="master"):
+        """Получает содержимое файла из репозитория по пути с кэшированием"""
+        cache_key = (owner, repo, path, ref)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        url = f"{self.api_base}/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+        r = self.safe_request("GET", url)
+        if r is None:
+            return None
+
+        content = r.json().get("content")
+        if content:
+            decoded = base64.b64decode(content).decode("utf-8")
+            self._cache[cache_key] = decoded
+            return decoded
+        return None
+
+
 def detect_git_repo():
-    import subprocess
-    import os
     try:
         url = subprocess.check_output(
             ['git', 'config', '--get', 'remote.origin.url'],
@@ -193,13 +221,21 @@ def handle_create_issue(args, client):
     template = client.get_template_content(owner, repo, path) if path else ""
 
     if args.desc_file:
-        with open(args.desc_file, 'r', encoding='utf-8') as f:
+        with open(args.desc_file, "r", encoding="utf-8") as f:
             body = f.read()
     else:
-        if template:
-            body = interactive_issue_input(template)
-        else:
-            print("⚠️ No issue template found. Please provide description manually.")
+        body = ""
+        if owner == "openharmony":
+            content = client.get_file_from_repo(owner, repo, ".gitee/ISSUE_TEMPLATE.zh-CN.md")
+            if content:
+                print("📄 Issue шаблон найден. Вы можете использовать его как есть или отредактировать.")
+                print("-" * 60)
+                print(content)
+                print("-" * 60)
+                answer = prompt("Enter issue description (leave blank to use template) > ")
+                body = answer if answer.strip() else content
+
+        if not body:
             body = prompt("Issue Description > ")
 
     title = args.title or prompt("Issue Title > ")
@@ -241,15 +277,39 @@ def handle_create_pr(args, client, issue_url=None):
         with open(args.desc_file, 'r', encoding='utf-8') as f:
             pr_body = f.read()
     else:
+        pr_body = ""
+        commit_msg = ""
         try:
-            import subprocess
-            pr_body = subprocess.check_output(["git", "log", "-1", "--pretty=%B"], text=True).strip()
-            if not pr_body:
-                pr_body = prompt("PR Description > ")
-            else:
-                print("ℹ️ Using last commit message as PR description.")
+            commit_msg = subprocess.check_output(["git", "log", "-1", "--pretty=%B"], text=True).strip()
         except Exception:
-            pr_body = prompt("PR Description > ")
+            pass
+
+        template = None
+        if tgt_owner == "openharmony":
+            template = client.get_file_from_repo(tgt_owner, tgt_repo, ".gitee/PULL_REQUEST_TEMPLATE.zh-CN.md")
+
+        if template:
+            print("📄 PR шаблон найден. Вы можете выбрать одно из:")
+            print("1 - Использовать шаблон")
+            if commit_msg:
+                print("2 - Использовать commit message")
+            print("3 - Ввести вручную")
+            print("-" * 60)
+            choice = prompt("Выберите вариант [1/2/3] > ")
+
+            if choice == "1":
+                pr_body = template
+            elif choice == "2" and commit_msg:
+                pr_body = commit_msg
+            else:
+                pr_body = prompt("Введите описание PR > ")
+
+        elif commit_msg:
+            print("ℹ️ Используется описание последнего коммита")
+            pr_body = commit_msg
+
+        if not pr_body:
+            pr_body = prompt("Введите описание PR > ")
 
     if issue_url:
         lines = pr_body.splitlines()
@@ -266,7 +326,7 @@ def handle_create_pr(args, client, issue_url=None):
             lines.insert(0, f"IssueNo: {issue_url}")
         pr_body = "\n".join(lines)
 
-    title = pr_body.splitlines()[0] if pr_body else prompt("PR Title > ")
+    title = prompt("PR Title > ")
     head = f"{src_owner}/{src_repo}:{src_branch}"
 
     print("Creating PR with the following info:")
@@ -282,8 +342,6 @@ def handle_create_pr(args, client, issue_url=None):
 
 
 def handle_comment_pr(args, client):
-    import re
-
     owner = repo = pr_id = None
 
     if args.url:
@@ -318,7 +376,6 @@ def handle_comment_pr(args, client):
 
 
 def handle_list_pr(args, client):
-    import subprocess
 
     repos = args.repos.split(",") if args.repos else []
     if not repos:
@@ -338,7 +395,8 @@ def handle_list_pr(args, client):
     user_input = prompt(f"Enter user for listing PRs (current: {default_user}) > ")
     user = user_input or default_user
 
-    state = args.state or prompt("Enter PR state [open/closed/all] (default: open) > ") or "open"
+    #state = args.state or prompt("Enter PR state [open/closed/all] (default: open) > ") or "open"
+    state = args.state or prompt_state()
 
     for repo_full in repos:
         owner, repo = repo_full.strip().split("/")
@@ -410,6 +468,57 @@ def handle_show_comments(args, client):
         print(f"❌ Failed to fetch comments: {e}")
 
 
+def handle_list_pr_members(args, client):
+    # Чтение логинов из файла
+    members = get_members_from_file(args.file)
+
+    if not members:
+        print("❌ No members found.")
+        return
+
+    # Использовать репозиторий по умолчанию
+    repos = args.repos.split(",") if args.repos else ["openharmony/arkui_ace_engine"]
+    if not args.repos:
+        print("ℹ️ Репозиторий не указан. Используется по умолчанию: openharmony/arkui_ace_engine")
+
+    for repo_full in repos:
+        owner, repo = repo_full.split("/")
+        print(f"\n📂 {repo_full}")
+
+        for member in members:
+            prs = client.list_pull_requests(owner, repo, state="open", author=member)
+            for pr in prs:
+                conflicted = "⚠️ conflicted" if pr.get("mergeable") is False else ""
+                created = pr["created_at"].split("T")[0]
+                print(f"- #{pr['number']} {pr['title']} by {pr['user']['login']} on {created} {conflicted}")
+
+
+def get_members_from_file(file_path=None):
+    """Получить логины из файла, по умолчанию members.txt в текущем каталоге"""
+    if not file_path:
+        script_dir = Path(__file__).resolve().parent
+        file_path = os.path.join(script_dir, "members.txt")
+
+    if not os.path.isfile(file_path):
+        print(f"❌ Members file not found: {file_path}")
+        return []
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def prompt_state(default="open"):
+    state_completer = WordCompleter(['open', 'closed', 'all'], ignore_case=True)
+    state = prompt(f"Enter PR state (default: {default}) > ", completer=state_completer).strip()
+    return state if state else default
+
+
+def prompt_issue_type(default="bug"):
+    type_completer = WordCompleter(['bug', 'feature', 'enhancement'], ignore_case=True)
+    val = prompt(f"Issue type (default: {default}) > ", completer=type_completer).strip()
+    return val if val else default
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gitee Utility Tool")
     subparsers = parser.add_subparsers(dest="command")
@@ -448,6 +557,10 @@ def main():
     p_show.add_argument("--repo")
     p_show.add_argument("--pr-id")
 
+    p_listm = subparsers.add_parser("list-pr-members")
+    p_listm.add_argument("--repos")
+    p_listm.add_argument("--file")
+
     args = parser.parse_args()
     base_url, token = load_config()
     client = GiteeClient(base_url, token)
@@ -464,6 +577,8 @@ def main():
         handle_create_issue_and_pr(args, client)
     elif args.command == "show-comments":
         handle_show_comments(args, client)
+    elif args.command == "list-pr-members":
+        handle_list_pr_members(args, client)
 
 if __name__ == "__main__":
     main()
