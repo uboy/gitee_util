@@ -128,7 +128,7 @@ class GiteeClient:
 
 
     def get_file_from_repo(self, owner, repo, path, ref="master"):
-        """Получает содержимое файла из репозитория по пути с кэшированием"""
+        """Получает содержимое файла (или первого файла из каталога) по пути с кэшированием"""
         cache_key = (owner, repo, path, ref)
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -138,11 +138,23 @@ class GiteeClient:
         if r is None:
             return None
 
-        content = r.json().get("content")
+        result = r.json()
+
+        # Если это список (т.е. каталог), взять первый файл
+        if isinstance(result, list):
+            for item in result:
+                if item.get("type") == "file":
+                    nested_path = item.get("path")
+                    return self.get_file_from_repo(owner, repo, nested_path, ref)
+            return None
+
+        # Если это файл
+        content = result.get("content")
         if content:
             decoded = base64.b64decode(content).decode("utf-8")
             self._cache[cache_key] = decoded
             return decoded
+
         return None
 
 
@@ -226,7 +238,7 @@ def handle_create_issue(args, client):
     else:
         body = ""
         if owner == "openharmony":
-            content = client.get_file_from_repo(owner, repo, ".gitee/ISSUE_TEMPLATE.zh-CN.md")
+            content = client.get_file_from_repo(owner, ".gitee", ".gitee/ISSUE_TEMPLATE.zh-CN.md")
             if content:
                 print("📄 Issue шаблон найден. Вы можете использовать его как есть или отредактировать.")
                 print("-" * 60)
