@@ -17,6 +17,8 @@ import html
 from prompt_toolkit import prompt
 from bs4 import BeautifulSoup
 from pathlib import Path
+from dateutil import parser
+
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
 
@@ -388,34 +390,105 @@ def handle_comment_pr(args, client):
 
 
 def handle_list_pr(args, client):
+    from datetime import datetime
+    import os
 
-    repos = args.repos.split(",") if args.repos else []
-    if not repos:
-        owner, repo, _ = detect_git_repo()
-        if owner and repo:
-            current_repo = f"{owner}/{repo}"
-            user_input = prompt(f"Enter repositories to list PRs (comma-separated) [current: {current_repo}] > ")
-            repos = [user_input] if user_input else [current_repo]
+    # === Логины (авторы) ===
+    authors = []
+
+    if args.file:
+        file_path = args.file if os.path.exists(args.file) else os.path.join(os.path.dirname(__file__), "members.txt")
+        if not os.path.isfile(file_path):
+            print(f"❌ Members file not found: {file_path}")
+            return
+        with open(file_path, "r", encoding="utf-8") as f:
+            authors = [line.strip() for line in f if line.strip()]
+
+    elif args.user:
+        authors = [args.user]
+
+    else:
+        # поведение как в list-pr-members
+        file_path = os.path.join(os.path.dirname(__file__), "members.txt")
+        if os.path.isfile(file_path):
+            print("ℹ️ No user specified. Using members.txt by default.")
+            with open(file_path, "r", encoding="utf-8") as f:
+                authors = [line.strip() for line in f if line.strip()]
         else:
-            user_input = prompt("Enter repositories to list PRs (comma-separated) > ")
-            repos = user_input.split(",") if user_input else []
+            try:
+                import subprocess
+                default_user = subprocess.check_output(["git", "config", "user.name"], text=True).strip()
+            except:
+                default_user = ""
+            user_input = prompt(f"Enter user login (current: {default_user}) > ").strip()
+            authors = [user_input or default_user]
 
-    try:
-        default_user = subprocess.check_output(["git", "config", "user.name"], text=True).strip()
-    except Exception:
-        default_user = ""
-    user_input = prompt(f"Enter user for listing PRs (current: {default_user}) > ")
-    user = user_input or default_user
+    # === Репозитории ===
+    repos = args.repos.split(",") if args.repos else []
 
-    #state = args.state or prompt("Enter PR state [open/closed/all] (default: open) > ") or "open"
-    state = args.state or prompt_state()
+    if not repos:
+        repo_info = detect_git_repo()
+        if repo_info:
+            owner, repo, _ = repo_info
+            print(f"ℹ️ Repository not specified. Using current repo: {owner}/{repo}")
+            repos = [f"{owner}/{repo}"]
+        else:
+            print("ℹ️ Repository not specified. Using default: openharmony/arkui_ace_engine")
+            repos = ["openharmony/arkui_ace_engine"]
 
+    # === Параметры ===
+    state = args.state or ("all" if args.all else "open")
+    include_draft = args.include_draft
+    since_date = None
+    if args.since:
+        try:
+            since_date = datetime.strptime(args.since, "%Y-%m-%d")
+        except ValueError:
+            print("❌ Invalid date format. Use YYYY-MM-DD.")
+            return
+
+    # === Обработка каждого репозитория ===
     for repo_full in repos:
         owner, repo = repo_full.strip().split("/")
-        print(f"\n📂 {repo_full.strip()}")
-        prs = client.list_pull_requests(owner, repo, state, user)
-        for pr in tqdm(prs, desc=f"{repo}", ncols=100):
-            print(f"- #{pr['number']} {pr['title']} [{pr['state']}] {pr['html_url']}")
+        print(f"\n📂 {repo_full}")
+
+        if args.group_by_user:
+            # 🔹 Группировка по логину
+            for author in authors:
+                prs = client.list_pull_requests(owner, repo, state=state, author=author)
+                prs = filter_pull_requests(prs, include_draft, since_date)
+                print(f"\n👤 Author: {author}")
+                print_prs(prs)
+        else:
+            # 🔹 Объединённый список всех
+            all_prs = []
+            for author in authors:
+                prs = client.list_pull_requests(owner, repo, state=state, author=author)
+                all_prs.extend(prs)
+
+            all_prs = filter_pull_requests(all_prs, include_draft, since_date)
+            print_prs(all_prs)
+
+
+def filter_pull_requests(prs, include_draft, since_date):
+    filtered = []
+    for pr in prs:
+        if not include_draft and pr.get("draft", False):
+            continue
+        created = parser.isoparse(pr["created_at"])
+        if since_date and created < since_date:
+            continue
+        filtered.append(pr)
+    return filtered
+
+def print_prs(prs):
+    if not prs:
+        print("ℹ️ No matching PRs.")
+        return
+    for pr in prs:
+        created = parser.isoparse(pr["created_at"])
+        conflicted = "⚠️ conflicted" if pr.get("mergeable") is False else ""
+        print(f"- #{pr['number']} {pr['title']} [{pr['state']}] by {pr['user']['login']} on {created.date()} {conflicted}")
 
 
 def handle_create_issue_and_pr(args, client):
@@ -480,31 +553,6 @@ def handle_show_comments(args, client):
         print(f"❌ Failed to fetch comments: {e}")
 
 
-def handle_list_pr_members(args, client):
-    # Чтение логинов из файла
-    members = get_members_from_file(args.file)
-
-    if not members:
-        print("❌ No members found.")
-        return
-
-    # Использовать репозиторий по умолчанию
-    repos = args.repos.split(",") if args.repos else ["openharmony/arkui_ace_engine"]
-    if not args.repos:
-        print("ℹ️ Репозиторий не указан. Используется по умолчанию: openharmony/arkui_ace_engine")
-
-    for repo_full in repos:
-        owner, repo = repo_full.split("/")
-        print(f"\n📂 {repo_full}")
-
-        for member in members:
-            prs = client.list_pull_requests(owner, repo, state="open", author=member)
-            for pr in prs:
-                conflicted = "⚠️ conflicted" if pr.get("mergeable") is False else ""
-                created = pr["created_at"].split("T")[0]
-                print(f"- #{pr['number']} {pr['title']} by {pr['user']['login']} on {created} {conflicted}")
-
-
 def get_members_from_file(file_path=None):
     """Получить логины из файла, по умолчанию members.txt в текущем каталоге"""
     if not file_path:
@@ -552,10 +600,15 @@ def main():
     p_cmt.add_argument("--url")
     p_cmt.add_argument("--comment")
 
-    p_list = subparsers.add_parser("list-pr")
-    p_list.add_argument("--repos")
-    p_list.add_argument("--user")
-    p_list.add_argument("--state", default="open")
+    p_list = subparsers.add_parser("list-pr", help="List pull requests")
+    p_list.add_argument("--repos", help="Comma-separated list of owner/repo")
+    p_list.add_argument("--user", help="Login of single user")
+    p_list.add_argument("--file", help="File with list of logins (one per line)")
+    p_list.add_argument("--state", help="PR state (open, closed, all)")
+    p_list.add_argument("--all", action="store_true", help="Show all PRs regardless of state")
+    p_list.add_argument("--include-draft", action="store_true", help="Include draft pull requests")
+    p_list.add_argument("--since", help="Show PRs created after YYYY-MM-DD")
+    p_list.add_argument("--group-by-user", action="store_true", help="Group PRs by author")
 
     p_both = subparsers.add_parser("create-issue-pr")
     p_both.add_argument("--repo", required=True)
@@ -569,9 +622,6 @@ def main():
     p_show.add_argument("--repo")
     p_show.add_argument("--pr-id")
 
-    p_listm = subparsers.add_parser("list-pr-members")
-    p_listm.add_argument("--repos")
-    p_listm.add_argument("--file")
 
     args = parser.parse_args()
     base_url, token = load_config()
@@ -589,8 +639,7 @@ def main():
         handle_create_issue_and_pr(args, client)
     elif args.command == "show-comments":
         handle_show_comments(args, client)
-    elif args.command == "list-pr-members":
-        handle_list_pr_members(args, client)
+
 
 if __name__ == "__main__":
     main()
