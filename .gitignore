@@ -1,2 +1,13 @@
 config.ini
 members.txt
+/build/gitee_util/Analysis-00.toc
+/build/gitee_util/base_library.zip
+/build/gitee_util/EXE-00.toc
+/dist/gitee_util.exe
+/build/gitee_util/gitee_util.pkg
+/gitee_util.spec
+/build/gitee_util/PKG-00.toc
+/build/gitee_util/PYZ-00.pyz
+/build/gitee_util/PYZ-00.toc
+/build/gitee_util/warn-gitee_util.txt
+/build/gitee_util/xref-gitee_util.html
