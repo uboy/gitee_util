@@ -9,31 +9,87 @@ import subprocess
 import base64
 import json
 from configparser import ConfigParser
-from tqdm import tqdm
 from prompt_toolkit import prompt
-from prompt_toolkit.completion import WordCompleter
 import re
 import html
 from bs4 import BeautifulSoup
-from pathlib import Path
 from dateutil import parser as dateparser
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Any
+from pathlib import Path
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # see https://gitee.com/api/v5/swagger
+
+# Global variables
+# ANSI цвета
+GREEN = "\033[92m"
+RED = "\033[91m"
+RESET = "\033[0m"
+
+USE_COLOR = sys.stdout.isatty()
+def colorize(text, color):
+    return f"{color}{text}{RESET}" if USE_COLOR else text
+
+SUCCESS_LABELS = {"静态检查成功", "dco检查成功", "编译成功", "冒烟测试成功"}
+FAIL_LABELS = {"waiting_for_review", "waiting_on_author", "静态检查失败", "编译失败", "冒烟测试失败", "dco检查失败"}
+
+BASE_DIR = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
+CACHE_DIR = BASE_DIR / ".cache"
+CACHE_DIR.mkdir(exist_ok=True)
 # --------------------------------------------------------------------
 # Config / utils
 # --------------------------------------------------------------------
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
-
-
 def load_config():
+    CONFIG_NAME = "config.ini"
+    base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(__file__)
+    config_path = os.path.join(base_dir, CONFIG_NAME)
+
     config = ConfigParser()
-    config.read(CONFIG_FILE, encoding='utf-8')
-    base_url = config.get('gitee', 'gitee-url')
-    token = config.get('gitee', 'token')
-    return base_url.rstrip('/'), token
+    config.read(config_path, encoding="utf-8")
+
+    base_url = config.get("gitee", "gitee-url", fallback="https://gitee.com")
+    token = config.get("gitee", "token", fallback="")
+    members_file = config.get("gitee", "members", fallback="members.txt")
+
+    # если относительный — искать в base_dir
+    if not os.path.isabs(members_file):
+        members_file = os.path.join(base_dir, members_file)
+
+    return base_url, token, members_file
+
+
+def get_owner_config(client, owner: str, repo: str, ref: str = "master") -> Dict:
+    """
+    Загружает owner_config.json с кэшированием на неделю.
+    """
+    cache_file = CACHE_DIR / f"owner_config_{owner}_{repo}_{ref}.json"
+    max_age = 7 * 24 * 60 * 60  # 1 неделя в секундах
+
+    if cache_file.exists():
+        mtime = cache_file.stat().st_mtime
+        if (time.time() - mtime) < max_age:
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass  # если повреждён, просто перекачаем
+
+    # если нет кэша или он старый → качаем заново
+    content = client.get_file_from_repo(owner, repo, ".gitee/owner_config.json", ref=ref)
+    if not content:
+        return {}
+
+    try:
+        data = json.loads(content)
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return data
+    except json.JSONDecodeError:
+        return {}
 
 
 def strip_html_tags(text: str) -> str:
@@ -49,18 +105,23 @@ def strip_html_tags(text: str) -> str:
 # Gitee client (все запросы проходят через safe_request)
 # --------------------------------------------------------------------
 class GiteeClient:
-    def __init__(self, base_url: str, token: str):
+    def __init__(self, base_url: str, token: str, members: str):
         # base_url like "https://gitee.com"
         self.api_base = f"{base_url}/api/v5"
         self.session = requests.Session()
         # use access_token param to be compatible with Gitee API v5
         self.session.params = {"access_token": token}
+        # members file
+        self.members = members
         self._cache: Dict[Any, Any] = {}  # 🔒 Кэш для шаблонов и других ресурсов
+        retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+        self.session.mount("http://",  HTTPAdapter(max_retries=retry))
 
     def safe_request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
         """Выполняет запрос и печатает понятную ошибку при неудаче."""
         try:
-            r = self.session.request(method, url, **kwargs)
+            r = self.session.request(method, url, timeout=15, **kwargs)
             r.raise_for_status()
             return r
         except requests.HTTPError as e:
@@ -76,43 +137,46 @@ class GiteeClient:
     # ---- templates/files ----
     def get_file_from_repo(self, owner: str, repo: str, path: str, ref: str = "master") -> Optional[str]:
         """
-        Возвращает содержимое файла (или первого файла в каталоге) с кэшированием.
-        path может быть файлом или директорией (.gitee/ISSUE_TEMPLATE).
+        Возвращает содержимое файла (или спрашивает какой файл взять, если их несколько).
         """
         cache_key = ("file", owner, repo, path, ref)
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        if owner == "openharmony":
-            url = f"{self.api_base}/repos/{owner}/.gitee/contents/{path}?ref={ref}"
-        else:
-            url = f"{self.api_base}/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+        url = f"{self.api_base}/repos/{owner}/{repo}/contents/{path}?ref={ref}"
         r = self.safe_request("GET", url)
         if r is None:
             return None
 
-        result = r.json()
+        data = r.json()
 
-        # Если вернулся список (каталог) — попробуем найти первый файл
-        if isinstance(result, list):
-            for item in result:
-                if item.get("type") == "file":
-                    nested_path = item.get("path")
-                    # рекурсивно получить содержимое первого файла
-                    content = self.get_file_from_repo(owner, repo, nested_path, ref)
-                    if content:
-                        self._cache[cache_key] = content
-                        return content
-            return None
+        # если это директория
+        if isinstance(data, list):
+            candidates = [f for f in data if f["name"].lower().startswith(path.split("/")[-1].split("_")[0].lower())]
+            if not candidates:
+                return None
+            if len(candidates) == 1:
+                file_url = candidates[0]["download_url"]
+            else:
+                print("Несколько шаблонов найдено:")
+                for i, f in enumerate(candidates, 1):
+                    print(f"  {i}. {f['name']}")
+                choice = int(input("Выберите номер файла > ")) - 1
+                file_url = candidates[choice]["download_url"]
 
-        # Если это объект с ключом content — декодируем
-        content_b64 = result.get("content")
-        if content_b64:
-            decoded = base64.b64decode(content_b64).decode("utf-8")
-            self._cache[cache_key] = decoded
-            return decoded
+            r_file = self.safe_request("GET", file_url)
+            if r_file is None:
+                return None
+            decoded = r_file.text
+        else:  # если это файл
+            content = data.get("content")
+            if not content:
+                return None
+            decoded = base64.b64decode(content).decode("utf-8")
 
-        return None
+        self._cache[cache_key] = decoded
+        return decoded
+
 
     def get_issue_templates(self, owner: str, repo: str) -> List[Dict[str, Any]]:
         """Вернуть список файлов в .gitee/ISSUE_TEMPLATE (если есть). Кэшируем."""
@@ -130,25 +194,20 @@ class GiteeClient:
         self._cache[cache_key] = res
         return res
 
-    def get_template_content(self, owner: str, repo: str, path: str) -> Optional[str]:
-        """Получить содержание по path (wrapper для get_file_from_repo)."""
-        if not path:
-            return None
-        return self.get_file_from_repo(owner, repo, path)
-
     def get_labels(self, owner: str, repo: str) -> List[str]:
-        """Вернуть список меток репозитория (кэшируется)."""
         cache_key = ("labels", owner, repo)
         if cache_key in self._cache:
             return self._cache[cache_key]
-        url = f"{self.api_base}/repos/{owner}/{repo}/labels"
-        r = self.safe_request("GET", url)
-        if r is None:
-            return []
-        try:
-            labels = [lbl.get("name") for lbl in r.json() if "name" in lbl]
-        except Exception:
-            labels = []
+        labels, page = [], 1
+        while True:
+            url = f"{self.api_base}/repos/{owner}/{repo}/labels?per_page=100&page={page}"
+            r = self.safe_request("GET", url)
+            if not r: break
+            page_data = r.json() or []
+            labels.extend([lbl.get("name") for lbl in page_data if "name" in lbl])
+            if len(page_data) < 100: break
+            page += 1
+        labels = list(dict.fromkeys(labels))
         self._cache[cache_key] = labels
         return labels
 
@@ -244,22 +303,27 @@ def detect_git_repo():
     try:
         url = subprocess.check_output(
             ['git', 'config', '--get', 'remote.origin.url'],
-            stderr=subprocess.DEVNULL,
-            text=True
+            stderr=subprocess.DEVNULL, text=True
         ).strip()
         branch = subprocess.check_output(
             ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-            stderr=subprocess.DEVNULL,
-            text=True
+            stderr=subprocess.DEVNULL, text=True
         ).strip()
-        # Normalize
+
         if url.endswith('.git'):
             url = url[:-4]
-        parts = url.split('/')[-2:]
-        owner, repo = parts[0], parts[1]
+
+        owner = repo = None
+        if "@" in url and ":" in url and "/" in url:          # SSH: git@host:owner/repo
+            path = url.split(":", 1)[1]
+            owner, repo = path.split("/", 1)
+        else:                                                  # HTTPS: https://host/owner/repo
+            owner, repo = url.rstrip("/").split("/")[-2:]
+
         return owner, repo, branch
     except Exception:
         return None, None, None
+
 
 
 def translate_question(ch: str) -> str:
@@ -273,23 +337,6 @@ def translate_question(ch: str) -> str:
         "该需求带来的价值、应用场景？": "Value and application scenario of this feature?"
     }
     return translations.get(ch.strip(), ch)
-
-
-def interactive_issue_input(template: str) -> str:
-    """Построчное заполнение шаблона (ищем заголовки '###' и запрашиваем ответы)."""
-    if not template:
-        return ""
-    sections = []
-    for line in template.splitlines():
-        if line.startswith("###"):
-            q_chinese = line.strip("# ").strip()
-            q_english = translate_question(q_chinese)
-            answer = prompt(f"{q_english}\n> ")
-            while not answer.strip():
-                print("⚠️ This field cannot be empty.")
-                answer = prompt(f"{q_english}\n> ")
-            sections.append(f"### {q_chinese}\n{answer}\n")
-    return "\n".join(sections)
 
 
 # --------------------------------------------------------------------
@@ -315,14 +362,6 @@ def prepare_issue_data(args, client: GiteeClient) -> Optional[Dict]:
     else:
         # try repo template first
         template = client.get_file_from_repo(owner, repo, ".gitee/ISSUE_TEMPLATE.zh-CN.md")
-        if not template:
-            # fallback to ISSUE_TEMPLATE directory
-            templates = client.get_issue_templates(owner, repo)
-            if templates:
-                # pick first template file path
-                tpath = templates[0].get("path")
-                if tpath:
-                    template = client.get_file_from_repo(owner, repo, tpath)
         if template:
             body = choose_issue_description_ui(template, prompt_text="Issue Description > ")
         else:
@@ -353,7 +392,8 @@ def prepare_pr_data(args, client: GiteeClient, issue_url: Optional[str] = None) 
     if not src_branch:
         src_branch = prompt("Current branch (source) > ")
 
-    base = args.base or prompt("Target base branch (e.g. master) > ")
+    #base = args.base or prompt("Target base branch (e.g. master) > ")
+    base = args.base
 
     # target repo: either args.repo (owner/repo) or same as source repo
     tgt_repo_full = args.repo if args.repo else f"{src_owner}/{src_repo}"
@@ -380,11 +420,8 @@ def prepare_pr_data(args, client: GiteeClient, issue_url: Optional[str] = None) 
             commit_msg = subprocess.check_output(["git", "log", "-1", "--pretty=%B"], text=True).strip()
         except Exception:
             commit_msg = ""
-
-        template = None
-        # special-case for openharmony owner — use central PR template from that repo if available
-        if tgt_owner == "openharmony":
-            template = client.get_file_from_repo(tgt_owner, tgt_repo, ".gitee/PULL_REQUEST_TEMPLATE.zh-CN.md")
+        # get template for current repository or in {owner}/.gitee
+        template = client.get_file_from_repo(tgt_owner, tgt_repo, ".gitee/PULL_REQUEST_TEMPLATE.zh-CN.md")
 
         pr_body = choose_description_ui(template=template, commit_msg=commit_msg, prompt_text="PR Description > ")
 
@@ -495,11 +532,101 @@ def filter_pull_requests(prs: List[Dict], include_draft: bool, since_date: Optio
     return out
 
 
-def print_pr_item(pr: Dict, owner: str, repo: str):
+def print_pr_item(pr: Dict, owner: str, repo: str, extended: bool = False, members_list=None, owner_config=None):
     created = dateparser.isoparse(pr["created_at"])
     conflicted = "⚠️ conflicted" if pr.get("mergeable") is False else ""
-    print(f"- #{pr['number']} {pr['title']} [{pr['state']}] by {pr['user']['login']} on {created.date()} {conflicted}")
+    drafted = "⚠️ draft" if pr.get("draft") is True else ""
+    print(f"- #{pr['number']} {pr['title']} [{pr['state']}] by {pr['user']['login']} on {created.date()} {conflicted} {drafted}")
     print(f"  {pr.get('html_url')}")
+
+    if extended:
+        # labels
+        labels = [lbl.get("name") for lbl in pr.get("labels", []) if "name" in lbl]
+        if labels:
+            colored_labels = [colorize_label(l) for l in labels]
+            print(f"  labels: {', '.join(colored_labels)}")
+
+        # reviewers
+        reviewers = pr.get("assignees", [])
+        if reviewers:
+            sorted_reviewers = sort_and_colorize_users(reviewers, accept_key="accept", filter_key="assignee")
+            print(f"  Reviewers: {', '.join(sorted_reviewers)}")
+
+        # code owners
+        code_owners = pr.get("assignees", [])
+        if code_owners:
+            sorted_codeowners = sort_and_colorize_users(code_owners, accept_key="accept", filter_key="code_owner")
+            print(f"  Code Owners: {', '.join(sorted_codeowners)}")
+
+        # testers
+        testers = pr.get("testers", [])
+        if testers:
+            sorted_testers = sort_and_colorize_users(testers, accept_key="accept")
+            print(f"  Testers: {', '.join(sorted_testers)}")
+
+        # branch
+        src_branch = pr.get("head", {}).get("ref", "")
+        tgt_branch = pr.get("base", {}).get("ref", "")
+        if src_branch or tgt_branch:
+            print(f"  branch: {src_branch} -> {tgt_branch}")
+
+        # --- Code Owners affected ---
+        if owner_config and members_list:
+            groups_dict = owner_config.get("groups", {}) or {}
+            # groups_dict имеет ключи в виде URL, приводим к коротким именам
+            short_groups = {
+                url.split("/")[-1]: members for url, members in groups_dict.items()
+            }
+            members_set = set(members_list)
+            affected: List[str] = []
+
+            # берём всех логинов, которые реально code_owner = true в PR
+            pr_code_owners = {
+                a.get("login")
+                for a in pr.get("assignees", [])
+                if a.get("code_owner") is True
+            }
+
+            # проверяем только группы, которые реально у PR
+            for g in pr_code_owners:
+                if g not in short_groups:
+                    continue
+                # логины из owner_config.json для группы g
+                group_users = [u.split("/")[-1] for u in short_groups[g] if isinstance(u, str)]
+                # пересечение: code_owner логины ∩ members.txt ∩ группа
+                affected.extend([u for u in group_users if u in members_set])
+
+            if affected:
+                print(f"  Code Owners affected: {', '.join(sorted(set(affected)))}")
+
+
+def colorize_label(lbl: str) -> str:
+    if lbl in SUCCESS_LABELS:
+        return colorize(lbl, GREEN)
+    if lbl in FAIL_LABELS:
+        return colorize(lbl, RED)
+    return lbl
+
+
+def sort_and_colorize_users(users: List[Dict], accept_key: str = "accept", filter_key: str = "") -> List[str]:
+    """
+    Сортирует пользователей: сначала те, у кого accept=True.
+    Красим зелёным если accept, красным если нет.
+    Если указан filter_key, то учитываются только пользователи у которых он True.
+    """
+    # 1) отфильтруем по роли (если указана)
+    filtered = [u for u in users if not filter_key or u.get(filter_key, False)]
+    # 2) отсортируем: сначала те, у кого accept=True
+    filtered.sort(key=lambda u: (not u.get(accept_key, False), u.get("login", "")))
+    # 3) раскрасим
+    out = []
+    for u in filtered:
+        login = u.get("login", "unknown")
+        if u.get(accept_key, False):
+            out.append(colorize(login+"(X)", GREEN))
+        else:
+            out.append(colorize(login, RED))
+    return out
 
 
 def handle_list_pr(args, client: GiteeClient):
@@ -523,12 +650,13 @@ def handle_list_pr(args, client: GiteeClient):
         authors = [args.user]
     else:
         # default behavior: try members.txt, else git user
-        file_path = os.path.join(os.path.dirname(__file__), "members.txt")
+        file_path = client.members
         if os.path.isfile(file_path):
             print("ℹ️ No user specified. Using members.txt by default.")
             with open(file_path, "r", encoding="utf-8") as f:
                 authors = [line.strip() for line in f if line.strip()]
         else:
+            print("ℹ️ No members file found. Trying to get usename from git.")
             try:
                 default_user = subprocess.check_output(["git", "config", "user.name"], text=True).strip()
             except Exception:
@@ -566,6 +694,8 @@ def handle_list_pr(args, client: GiteeClient):
         future_to_meta = {}
         for repo_full in repos:
             owner, repo = repo_full.strip().split("/")
+            # get owners
+            owner_config = get_owner_config(client, owner, repo)  # 🔹 загрузить и закэшировать
             for author in authors:
                 fut = executor.submit(client.list_pull_requests, owner, repo, state, author)
                 future_to_meta[fut] = (owner, repo, author)
@@ -598,7 +728,7 @@ def handle_list_pr(args, client: GiteeClient):
                         print("ℹ️ No PRs for this author.")
                         continue
                     for pr in author_prs:
-                        print_pr_item(pr, *repo_key.split("/"))
+                        print_pr_item(pr, *repo_key.split("/"), extended=args.extended_info, members_list=authors, owner_config=owner_config)
             else:
                 # print combined
                 all_prs = repo_grouped_results.get(repo_key, [])
@@ -606,7 +736,7 @@ def handle_list_pr(args, client: GiteeClient):
                     print("ℹ️ No PRs found.")
                 else:
                     for pr in all_prs:
-                        print_pr_item(pr, *repo_key.split("/"))
+                        print_pr_item(pr, *repo_key.split("/"), extended=args.extended_info, members_list=authors, owner_config=owner_config)
 
 
 # --------------------------------------------------------------------
@@ -616,7 +746,8 @@ def handle_comment_pr(args, client: GiteeClient):
     owner = repo = pr_id = None
 
     if args.url:
-        match = re.match(r"https?://gitee\.com/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
+        #match = re.match(r"https?://gitee\.com/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
+        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
         if match:
             owner, repo, pr_id = match.groups()
         else:
@@ -751,7 +882,8 @@ def handle_create_issue_and_pr(args, client: GiteeClient):
 def handle_show_comments(args, client: GiteeClient):
     owner = repo = pr_id = None
     if args.url:
-        match = re.match(r"https?://gitee\.com/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
+        #match = re.match(r"https?://gitee\.com/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
+        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
         if match:
             owner, repo, pr_id = match.groups()
         else:
@@ -819,14 +951,14 @@ def main():
         description="""Создаёт новую задачу (Issue) в указанном репозитории.
 
 Примеры:
-  gitee_util.py create-issue --repo owner/repo --type bug --title "Ошибка" --desc-file bug.txt
-  gitee_util.py create-issue --repo owner/repo --type feature
+  gitee_util.py create-issue --repo target_owner/target_repo --type bug --title "Ошибка" --desc-file bug.txt
+  gitee_util.py create-issue --repo target_owner/target_repo --type feature
 
 Если --desc-file не указан, будет предложено ввести описание вручную
 или выбрать шаблон (если он есть в репозитории).""",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    p_issue.add_argument("--repo", required=True, help="Репозиторий в формате owner/repo")
+    p_issue.add_argument("--repo", required=True, help="Репозиторий назначения (owner/repo)")
     p_issue.add_argument("--type", choices=["bug", "feature"], required=True, help="Тип задачи")
     p_issue.add_argument("--title", help="Заголовок Issue")
     p_issue.add_argument("--desc-file", help="Файл с описанием Issue")
@@ -845,7 +977,7 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     p_pr.add_argument("--repo", help="Репозиторий назначения (owner/repo)")
-    p_pr.add_argument("--base", help="Целевая ветка (по умолчанию master)")
+    p_pr.add_argument("--base", default="master", help="Целевая ветка (по умолчанию master)")
     p_pr.add_argument("--desc-file", help="Файл с описанием PR")
 
     # ===== comment-pr =====
@@ -860,7 +992,7 @@ def main():
 """,
         formatter_class=argparse.RawTextHelpFormatter
     )
-    p_cmt.add_argument("--repo", help="Репозиторий (owner/repo)")
+    p_cmt.add_argument("--repo", help="Репозиторий назначения (owner/repo)")
     p_cmt.add_argument("--pr-id", help="ID Pull Request")
     p_cmt.add_argument("--url", help="Полный URL PR")
     p_cmt.add_argument("--comment", help="Текст комментария")
@@ -887,6 +1019,7 @@ def main():
     p_list.add_argument("--include-draft", action="store_true", help="Включать черновики (draft)")
     p_list.add_argument("--since", help="Выводить PR, созданные после даты YYYY-MM-DD")
     p_list.add_argument("--group-by-user", action="store_true", help="Группировать вывод по пользователям")
+    p_list.add_argument("--extended-info", action="store_true", help="Показывать расширенную информацию (labels, reviewers, code owners, testers)")
 
     # ===== create-issue-pr =====
     p_both = subparsers.add_parser(
@@ -901,11 +1034,11 @@ def main():
 Если --desc-file не указан, будет предложено ввести описание или выбрать шаблон.""",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    p_both.add_argument("--repo", required=True, help="Репозиторий (owner/repo)")
+    p_both.add_argument("--repo", required=True, help="Репозиторий назначения (owner/repo, openharmony/arkui_ace_engine)")
     p_both.add_argument("--type", choices=["bug", "feature"], required=True, help="Тип задачи")
     p_both.add_argument("--title", help="Заголовок")
     p_both.add_argument("--desc-file", help="Файл с описанием")
-    p_both.add_argument("--base", help="Целевая ветка PR (по умолчанию master)")
+    p_both.add_argument("--base", default="master", help="Целевая ветка PR (по умолчанию master)")
 
     # ===== show-comments =====
     p_show = subparsers.add_parser(
@@ -923,9 +1056,13 @@ def main():
     p_show.add_argument("--pr-id", help="ID PR")
 
     # ==== запуск ====
-    args = arg_parser.parse_args()
-    base_url, token = load_config()
-    client = GiteeClient(base_url, token)
+    try:
+        args = arg_parser.parse_args()
+    except argparse.ArgumentError as error:
+        arg_parser.print_help()
+        arg_parser.error(str(error))
+    base_url, token, members = load_config()
+    client = GiteeClient(base_url, token, members)
 
     if args.command == "create-issue":
         handle_create_issue(args, client)
@@ -939,7 +1076,9 @@ def main():
         handle_create_issue_and_pr(args, client)
     elif args.command == "show-comments":
         handle_show_comments(args, client)
-
+    else:
+        arg_parser.print_help()
+        return 1
 
 if __name__ == "__main__":
     main()

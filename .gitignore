@@ -11,3 +11,5 @@ members.txt
 /build/gitee_util/PYZ-00.toc
 /build/gitee_util/warn-gitee_util.txt
 /build/gitee_util/xref-gitee_util.html
+/.cache/owner_config_openharmony_arkui_ace_engine_master.json
+/dist/.cache/owner_config_openharmony_arkui_ace_engine_master.json
