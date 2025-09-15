@@ -22,8 +22,8 @@ import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# see https://gitee.com/api/v5/swagger
-# test link https://gitee.com/api/v5/repos/openharmony/arkui_ace_engine/pulls?base=OpenHarmony_feature_20250702&state=open&id=69593
+# see https://docs.gitcode.com/docs/apis/
+# test link https://gitcode.com/api/v5/repos/openharmony/arkui_ace_engine/pulls?base=OpenHarmony_feature_20250702&state=open&id=69593
 
 # Global variables
 # ANSI цвета
@@ -52,9 +52,9 @@ def load_config():
     config = ConfigParser()
     config.read(config_path, encoding="utf-8")
 
-    base_url = config.get("gitee", "gitee-url", fallback="https://gitee.com")
-    token = config.get("gitee", "token", fallback="")
-    members_file = config.get("gitee", "members", fallback="members.txt")
+    base_url = config.get("gitcode", "gitcode-url", fallback="https://gitcode.com")
+    token = config.get("gitcode", "token", fallback="")
+    members_file = config.get("gitcode", "members", fallback="members.txt")
 
     # если относительный — искать в base_dir
     if not os.path.isabs(members_file):
@@ -80,7 +80,7 @@ def get_owner_config(client, owner: str, repo: str, ref: str = "master") -> Dict
                 pass  # если повреждён, просто перекачаем
 
     # если нет кэша или он старый → качаем заново
-    content = client.get_file_from_repo(owner, repo, ".gitee/owner_config.json", ref=ref)
+    content = client.get_file_from_repo(owner, repo, ".gitcode/owner_config.json", ref=ref)
     if not content:
         return {}
 
@@ -107,10 +107,10 @@ def strip_html_tags(text: str) -> str:
 # --------------------------------------------------------------------
 class GiteeClient:
     def __init__(self, base_url: str, token: str, members: str):
-        # base_url like "https://gitee.com"
+        # base_url like "https://gitcode.com"
         self.api_base = f"{base_url}/api/v5"
         self.session = requests.Session()
-        # use access_token param to be compatible with Gitee API v5
+        # use access_token param to be compatible with Gitcode API v5
         self.session.params = {"access_token": token}
         # members file
         self.members = members
@@ -128,7 +128,7 @@ class GiteeClient:
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
             text = getattr(e.response, "text", "")
-            print(f"❌ Gitee API error: {status}\n{text}")
+            print(f"❌ Gitcode API error: {status}\n{text}\n{url}")
             return None
         except requests.RequestException as e:
             print(f"❌ Network error: {e}")
@@ -180,12 +180,12 @@ class GiteeClient:
 
 
     def get_issue_templates(self, owner: str, repo: str) -> List[Dict[str, Any]]:
-        """Вернуть список файлов в .gitee/ISSUE_TEMPLATE (если есть). Кэшируем."""
+        """Вернуть список файлов в .gitcode/ISSUE_TEMPLATE (если есть). Кэшируем."""
         cache_key = ("templates", owner, repo, "issue")
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        url = f"{self.api_base}/repos/{owner}/{repo}/contents/.gitee/ISSUE_TEMPLATE"
+        url = f"{self.api_base}/repos/{owner}/{repo}/contents/.gitcode/ISSUE_TEMPLATE"
         r = self.safe_request("GET", url)
         if r is None:
             return []
@@ -413,13 +413,13 @@ def prepare_issue_data(args, client: GiteeClient) -> Optional[Dict]:
     # title
     title = args.title or prompt("Issue Title > ")
 
-    # body: priority - desc_file -> repo template (for openharmony use central .gitee) -> interactive
+    # body: priority - desc_file -> repo template (for openharmony use central .gitcode) -> interactive
     if args.desc_file:
         with open(args.desc_file, "r", encoding="utf-8") as f:
             body = f.read()
     else:
         # try repo template first
-        template = client.get_file_from_repo(owner, repo, ".gitee/ISSUE_TEMPLATE.zh-CN.md")
+        template = client.get_file_from_repo(owner, repo, ".gitcode/ISSUE_TEMPLATE.zh-CN.md")
         if template:
             body = choose_issue_description_ui(template, prompt_text="Issue Description > ")
         else:
@@ -489,8 +489,8 @@ def prepare_pr_data(args, client: GiteeClient, issue_url: Optional[str] = None) 
             commit_msg = subprocess.check_output(["git", "log", "-1", "--pretty=%B"], text=True).strip()
         except Exception:
             commit_msg = ""
-        # get template for current repository or in {owner}/.gitee
-        template = client.get_file_from_repo(tgt_owner, tgt_repo, ".gitee/PULL_REQUEST_TEMPLATE.zh-CN.md")
+        # get template for current repository or in {owner}/.gitcode
+        template = client.get_file_from_repo(tgt_owner, tgt_repo, ".gitcode/PULL_REQUEST_TEMPLATE.zh-CN.md")
 
         pr_body = choose_description_ui(template=template, commit_msg=commit_msg, prompt_text="PR Description > ")
 
@@ -522,7 +522,7 @@ def prepare_pr_data(args, client: GiteeClient, issue_url: Optional[str] = None) 
 #    if not title:
 #        title = prompt("PR Title > ")
 
-    head = f"{src_owner}/{src_repo}:{src_branch}"  # Gitee expects "fork_owner:branch" or just "branch" if same repo/fork
+    head = f"{src_owner}/{src_repo}:{src_branch}"  # Gitcode expects "fork_owner:branch" or just "branch" if same repo/fork
     return {
         "tgt_owner": tgt_owner,
         "tgt_repo": tgt_repo,
@@ -823,7 +823,6 @@ def handle_comment_pr(args, client: GiteeClient):
     owner = repo = pr_id = None
 
     if args.url:
-        #match = re.match(r"https?://gitee\.com/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
         match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
         if match:
             owner, repo, pr_id = match.groups()
@@ -836,7 +835,7 @@ def handle_comment_pr(args, client: GiteeClient):
     else:
         input_val = prompt("Enter pull request URL or owner/repo > ")
         if input_val.startswith("http"):
-            match = re.match(r"https?://gitee\.com/([^/]+)/([^/]+)/pulls/(\d+)", input_val)
+            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/pulls/(\d+)", input_val)
             if match:
                 owner, repo, pr_id = match.groups()
             else:
@@ -959,7 +958,6 @@ def handle_create_issue_and_pr(args, client: GiteeClient):
 def handle_show_comments(args, client: GiteeClient):
     owner = repo = pr_id = None
     if args.url:
-        #match = re.match(r"https?://gitee\.com/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
         match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
         if match:
             owner, repo, pr_id = match.groups()
@@ -973,7 +971,7 @@ def handle_show_comments(args, client: GiteeClient):
         # Интерактивный ввод
         input_val = prompt("Enter pull request URL or owner/repo > ")
         if input_val.startswith("http"):
-            match = re.match(r"https?://gitee\.com/([^/]+)/([^/]+)/pulls/(\d+)", input_val)
+            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/pulls/(\d+)", input_val)
             if match:
                 owner, repo, pr_id = match.groups()
             else:
@@ -1006,14 +1004,14 @@ def handle_show_comments(args, client: GiteeClient):
 # --------------------------------------------------------------------
 def main():
     description = """\
-    Gitee Utility Tool — набор инструментов для работы с Gitee API.
+    Gitcode Utility Tool — набор инструментов для работы с Gitcode API.
 
     Подсказка:
       Для подробной помощи по конкретной команде используйте:
-        gitee_util.py <команда> --help
+        gitcode_util.py <команда> --help
 
     Пример:
-      gitee_util.py create-issue-pr --help
+      gitcode_util.py create-issue-pr --help
     """
     arg_parser = argparse.ArgumentParser(
         description=description,
@@ -1028,8 +1026,8 @@ def main():
         description="""Создаёт новую задачу (Issue) в указанном репозитории.
 
 Примеры:
-  gitee_util.py create-issue --repo target_owner/target_repo --type bug --title "Ошибка" --desc-file bug.txt
-  gitee_util.py create-issue --repo target_owner/target_repo --type feature
+  gitcode_util.py create-issue --repo target_owner/target_repo --type bug --title "Ошибка" --desc-file bug.txt
+  gitcode_util.py create-issue --repo target_owner/target_repo --type feature
 
 Если --desc-file не указан, будет предложено ввести описание вручную
 или выбрать шаблон (если он есть в репозитории).""",
@@ -1047,8 +1045,8 @@ def main():
         description="""Создаёт Pull Request из текущей локальной ветки в указанную ветку репозитория.
 
 Примеры:
-  gitee_util.py create-pr --repo owner/repo --base master
-  gitee_util.py create-pr --repo owner/repo --desc-file pr_desc.txt
+  gitcode_util.py create-pr --repo owner/repo --base master
+  gitcode_util.py create-pr --repo owner/repo --desc-file pr_desc.txt
 
 Если описание не указано, можно выбрать шаблон PR или использовать последний коммит.""",
         formatter_class=argparse.RawTextHelpFormatter
@@ -1064,8 +1062,8 @@ def main():
         description="""Добавляет комментарий в указанный PR.
 
 Примеры:
-  gitee_util.py comment-pr --repo owner/repo --pr-id 123 --comment "Отличная работа!"
-  gitee_util.py comment-pr --url https://gitee.com/owner/repo/pulls/123 --comment "Нужно поправить тесты"
+  gitcode_util.py comment-pr --repo owner/repo --pr-id 123 --comment "Отличная работа!"
+  gitcode_util.py comment-pr --url https://gitcode.com/owner/repo/pull/123 --comment "Нужно поправить тесты"
 """,
         formatter_class=argparse.RawTextHelpFormatter
     )
@@ -1081,9 +1079,9 @@ def main():
         description="""Выводит список Pull Request'ов с фильтрацией по пользователям, дате и статусу.
 
 Примеры:
-  gitee_util.py list-pr --repos owner/repo --user dev1
-  gitee_util.py list-pr --repos owner/repo --file members.txt --since 2025-08-01
-  gitee_util.py list-pr --all --include-draft
+  gitcode_util.py list-pr --repos owner/repo --user dev1
+  gitcode_util.py list-pr --repos owner/repo --file members.txt --since 2025-08-01
+  gitcode_util.py list-pr --all --include-draft
 
 По умолчанию выводятся все открытые PR из файла members.txt или из текущего пользователя.""",
         formatter_class=argparse.RawTextHelpFormatter
@@ -1105,8 +1103,8 @@ def main():
         description="""Создаёт новую задачу (Issue) и сразу Pull Request, привязанный к ней.
 
 Примеры:
-  gitee_util.py create-issue-pr --repo owner/repo --type bug --title "Ошибка" --desc-file bug.txt
-  gitee_util.py create-issue-pr --repo owner/repo --type feature
+  gitcode_util.py create-issue-pr --repo owner/repo --type bug --title "Ошибка" --desc-file bug.txt
+  gitcode_util.py create-issue-pr --repo owner/repo --type feature
 
 Если --desc-file не указан, будет предложено ввести описание или выбрать шаблон.""",
         formatter_class=argparse.RawTextHelpFormatter
@@ -1124,8 +1122,8 @@ def main():
         description="""Выводит список комментариев к указанному Pull Request.
 
 Примеры:
-  gitee_util.py show-comments --repo owner/repo --pr-id 123
-  gitee_util.py show-comments --url https://gitee.com/owner/repo/pulls/123""",
+  gitcode_util.py show-comments --repo owner/repo --pr-id 123
+  gitcode_util.py show-comments --url https://gitcode.com/owner/repo/pulls/123""",
         formatter_class=argparse.RawTextHelpFormatter
     )
     p_show.add_argument("--url", help="Полный URL PR")
