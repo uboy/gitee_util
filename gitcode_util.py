@@ -122,7 +122,7 @@ class GiteeClient:
     def safe_request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
         """Выполняет запрос и печатает понятную ошибку при неудаче."""
         try:
-            r = self.session.request(method, url, timeout=15, **kwargs)
+            r = self.session.request(method, url, timeout=(5, 10), **kwargs)
             r.raise_for_status()
             return r
         except requests.HTTPError as e:
@@ -324,6 +324,16 @@ class GiteeClient:
             if p_owner and p_repo:
                 return f"{p_owner}/{p_repo}"
         return None
+
+    def get_single_pull_request(self, owner: str, repo: str, pr_number: int) -> Optional[Dict]:
+        """
+        Получает детальную информацию по PR, включая mergeable_state.
+        """
+        url = f"{self.api_base}/repos/{owner}/{repo}/pulls/{pr_number}"
+        r = self.safe_request("GET", url)
+        if r is None:
+            return None
+        return r.json()
 
 
 # --------------------------------------------------------------------
@@ -603,7 +613,7 @@ def filter_pull_requests(prs: List[Dict], include_draft: bool, since_date: Optio
 
 def print_pr_item(pr: Dict, owner: str, repo: str, extended: bool = False, members_list=None, owner_config=None):
     created = dateparser.isoparse(pr["created_at"])
-    conflicted = "⚠️ conflicted" if pr.get("mergeable") is False else ""
+    conflicted = "⚠️ conflicted" if pr.get("conflict_passed", True) is False else ""
     drafted = "⚠️ draft" if pr.get("draft") is True else ""
     print(f"- #{pr['number']} {pr['title']} [{pr['state']}] by {pr['user']['login']} on {created.date()} {conflicted} {drafted}")
     print(f"  {pr.get('html_url')}")
@@ -790,6 +800,13 @@ def handle_list_pr(args, client: GiteeClient):
             prs = filter_pull_requests(prs, include_draft, since_date)
             key = f"{owner}/{repo}"
             repo_grouped_results.setdefault(key, []).extend(prs)
+
+        for repo_full, prs in repo_grouped_results.items():
+            owner, repo = repo_full.split("/")
+            for pr in prs:
+                detailed_pr = client.get_single_pull_request(owner, repo, pr["number"])
+                if detailed_pr and "mergeable_state" in detailed_pr:
+                    pr["conflict_passed"] = detailed_pr["mergeable_state"].get("conflict_passed", False)
 
         # printing behavior: group_by_user => print grouped by user else print combined list
         for repo_full in repos:
