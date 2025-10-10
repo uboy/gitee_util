@@ -433,6 +433,7 @@ def prepare_issue_data(args, client: GiteeClient) -> Optional[Dict]:
         if template:
             body = choose_issue_description_ui(template, prompt_text="Issue Description > ")
         else:
+
             body = prompt("Issue Description > ")
 
     # labels: choose from repository labels
@@ -500,7 +501,7 @@ def prepare_pr_data(args, client: GiteeClient, issue_url: Optional[str] = None) 
         except Exception:
             commit_msg = ""
         # get template for current repository or in {owner}/.gitcode
-        template = client.get_file_from_repo(tgt_owner, tgt_repo, ".gitcode/PULL_REQUEST_TEMPLATE.zh-CN.md")
+        template = client.get_file_from_repo(tgt_owner, tgt_repo, ".gitcode/PULL_REQUEST_TEMPLATE.md")
 
         pr_body = choose_description_ui(template=template, commit_msg=commit_msg, prompt_text="PR Description > ")
 
@@ -701,7 +702,7 @@ def sort_and_colorize_users(users: List[Dict], accept_key: str = "accept", filte
     out = []
     for u in filtered:
         login = u.get("login", "unknown")
-        if u.get(accept_key, False):
+        if u.get(accept_key, True):
             out.append(colorize(login+"(X)", GREEN))
         else:
             out.append(colorize(login, RED))
@@ -840,7 +841,7 @@ def handle_comment_pr(args, client: GiteeClient):
     owner = repo = pr_id = None
 
     if args.url:
-        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
+        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pull/(\d+)", args.url)
         if match:
             owner, repo, pr_id = match.groups()
         else:
@@ -852,7 +853,7 @@ def handle_comment_pr(args, client: GiteeClient):
     else:
         input_val = prompt("Enter pull request URL or owner/repo > ")
         if input_val.startswith("http"):
-            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/pulls/(\d+)", input_val)
+            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/pull/(\d+)", input_val)
             if match:
                 owner, repo, pr_id = match.groups()
             else:
