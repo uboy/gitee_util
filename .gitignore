@@ -7,6 +7,7 @@ members.txt
 /dist/gitee_util.exe
 /build/gitee_util/gitee_util.pkg
 /gitee_util.spec
+*.spec
 /build/gitee_util/PKG-00.toc
 /build/gitee_util/PYZ-00.pyz
 /build/gitee_util/PYZ-00.toc
