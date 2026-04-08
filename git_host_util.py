@@ -5,15 +5,13 @@ import argparse
 import importlib
 import sys
 from configparser import ConfigParser
-from pathlib import Path
+from config_bootstrap import DEFAULT_PROVIDER, SUPPORTED_PROVIDERS as BOOTSTRAP_PROVIDERS, _config_path
 
-SUPPORTED_PROVIDERS = {"gitee", "gitcode"}
-DEFAULT_PROVIDER = "gitee"
+SUPPORTED_PROVIDERS = set(BOOTSTRAP_PROVIDERS)
 
 
 def _load_provider_from_config() -> str:
-    base_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-    config_path = base_dir / "config.ini"
+    config_path = _config_path()
     config = ConfigParser()
     config.read(config_path, encoding="utf-8")
     provider = config.get("general", "provider", fallback=DEFAULT_PROVIDER).strip().lower()

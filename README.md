@@ -21,24 +21,30 @@ pip install -r requirements.txt
 ```
 
 ## Конфигурация
-Укажите токены и URL в `config.ini` (в той же директории, что и скрипт):
+Конфиг хранится в `$XDG_CONFIG_HOME/gitee_util/config.ini`.
+Если `XDG_CONFIG_HOME` не задан, используется `~/.config/gitee_util/config.ini`.
+Если файла нет, утилита создаст его и попросит токен для выбранного провайдера.
 ```ini
 [general]
-provider = gitee
+provider = gitcode
 
 [gitee]
 gitee-url = https://gitee.com
 token = your_token_here
+members = members.txt
 
 [gitcode]
 gitcode-url = https://gitcode.com
 token = your_token_here
+members = members.txt
 ```
+
+Относительный путь `members` резолвится относительно каталога конфига.
 
 Приоритет выбора провайдера:
 - `--provider` в командной строке (высший приоритет)
 - `[general] provider` в `config.ini`
-- значение по умолчанию: `gitee`
+- значение по умолчанию: `gitcode`
 
 ## Примеры использования
 
@@ -74,6 +80,14 @@ python git_host_util.py --provider gitee list-pr --repos owner/repo1,owner/repo2
 - если `--repos` не указано — используется текущий git-репозиторий (если доступен)
 - если `--user` не указан — используется git user.name
 - если `--state` не указан — будет предложено ввести (по умолчанию open)
+
+Быстрый сценарий по умолчанию:
+```bash
+python git_host_util.py list-pr
+```
+- по умолчанию используется провайдер `gitcode`
+- если не заданы `--user`, `--file` и `--repos`, команда не запрашивает login
+- в этом режиме показываются открытые PR для всех авторов в `openharmony/arkui_ace_engine`
 
 ### 📂 Просмотр открытых PR от участников
 ```bash

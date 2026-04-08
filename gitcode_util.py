@@ -8,7 +8,6 @@ import requests
 import subprocess
 import base64
 import json
-from configparser import ConfigParser
 from prompt_toolkit import prompt
 import re
 import html
@@ -19,8 +18,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 import time
+import threading
+import itertools
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from config_bootstrap import ensure_provider_config, maybe_refresh_provider_token
 
 # see https://docs.gitcode.com/docs/apis/
 # test link https://gitcode.com/api/v5/repos/openharmony/arkui_ace_engine/pulls?base=OpenHarmony_feature_20250702&state=open&id=69593
@@ -37,6 +39,40 @@ def colorize(text, color):
 
 SUCCESS_LABELS = {"静态检查成功", "dco检查成功", "编译成功", "冒烟测试成功"}
 FAIL_LABELS = {"waiting_for_review", "waiting_on_author", "静态检查失败", "编译失败", "冒烟测试失败", "dco检查失败"}
+DEFAULT_LIST_PR_REPO = "openharmony/arkui_ace_engine"
+
+
+class _Spinner:
+    """Simple TTY spinner that runs in a background thread."""
+    _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, message: str = ""):
+        self._msg = message
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+
+    def _spin(self):
+        for frame in itertools.cycle(self._FRAMES):
+            if self._stop.is_set():
+                break
+            sys.stderr.write(f"\r{frame} {self._msg}  ")
+            sys.stderr.flush()
+            self._stop.wait(0.1)
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+
+    def update(self, message: str):
+        self._msg = message
+
+    def __enter__(self):
+        if sys.stderr.isatty():
+            self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.5)
 
 BASE_DIR = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
 CACHE_DIR = BASE_DIR / ".cache"
@@ -45,22 +81,7 @@ CACHE_DIR.mkdir(exist_ok=True)
 # Config / utils
 # --------------------------------------------------------------------
 def load_config():
-    CONFIG_NAME = "config.ini"
-    base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(__file__)
-    config_path = os.path.join(base_dir, CONFIG_NAME)
-
-    config = ConfigParser()
-    config.read(config_path, encoding="utf-8")
-
-    base_url = config.get("gitcode", "gitcode-url", fallback="https://gitcode.com")
-    token = config.get("gitcode", "token", fallback="")
-    members_file = config.get("gitcode", "members", fallback="members.txt")
-
-    # если относительный — искать в base_dir
-    if not os.path.isabs(members_file):
-        members_file = os.path.join(base_dir, members_file)
-
-    return base_url, token, members_file
+    return ensure_provider_config("gitcode")
 
 
 def get_owner_config(client, owner: str, repo: str, ref: str = "master") -> Dict:
@@ -106,7 +127,7 @@ def strip_html_tags(text: str) -> str:
 # Gitee client (все запросы проходят через safe_request)
 # --------------------------------------------------------------------
 class GiteeClient:
-    def __init__(self, base_url: str, token: str, members: str):
+    def __init__(self, base_url: str, token: str, members: str, config_path: str):
         # base_url like "https://gitcode.com"
         self.api_base = f"{base_url}/api/v5"
         self.session = requests.Session()
@@ -114,6 +135,8 @@ class GiteeClient:
         self.session.params = {"access_token": token}
         # members file
         self.members = members
+        self.config_path = config_path
+        self._auth_retry_used = False
         self._cache: Dict[Any, Any] = {}  # 🔒 Кэш для шаблонов и других ресурсов
         retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
@@ -128,6 +151,12 @@ class GiteeClient:
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
             text = getattr(e.response, "text", "")
+            if status in (401, 403) and not self._auth_retry_used:
+                self._auth_retry_used = True
+                refreshed_token = maybe_refresh_provider_token("gitcode", self.config_path)
+                if refreshed_token:
+                    self.session.params = {"access_token": refreshed_token}
+                    return self.safe_request(method, url, **kwargs)
             print(f"❌ Gitcode API error: {status}\n{text}\n{url}")
             return None
         except requests.RequestException as e:
@@ -247,14 +276,16 @@ class GiteeClient:
             return None
         return r.json()
 
-    def list_pull_requests(self, owner: str, repo: str, state: str = "open", author: Optional[str] = None, per_page: int = 50) -> List[Dict]:
+    def list_pull_requests(self, owner: str, repo: str, state: str = "open", author: Optional[str] = None, per_page: int = 50, max_results: int = 0) -> List[Dict]:
         """
         Собирает PR'ы с пагинацией. Возвращает массив PR.
+        max_results > 0 — остановить сбор как только набрали достаточно.
         """
         collected = []
         page = 1
+        fetch_size = per_page if max_results == 0 else min(per_page, max_results)
         while True:
-            url = f"{self.api_base}/repos/{owner}/{repo}/pulls?state={state}&per_page={per_page}&page={page}"
+            url = f"{self.api_base}/repos/{owner}/{repo}/pulls?state={state}&per_page={fetch_size}&page={page}"
             if author:
                 url += f"&author={author}"
             r = self.safe_request("GET", url)
@@ -264,8 +295,10 @@ class GiteeClient:
             if not page_data:
                 break
             collected.extend(page_data)
-            # Если меньше, чем per_page — конец
-            if len(page_data) < per_page:
+            if max_results > 0 and len(collected) >= max_results:
+                break
+            # Если меньше, чем fetch_size — конец
+            if len(page_data) < fetch_size:
                 break
             page += 1
         return collected
@@ -612,8 +645,11 @@ def print_pr_item(pr: Dict, owner: str, repo: str, extended: bool = False, membe
     created = dateparser.isoparse(pr["created_at"])
     conflicted = "⚠️ conflicted" if pr.get("conflict_passed", True) is False else ""
     drafted = "⚠️ draft" if pr.get("draft") is True else ""
+    tgt_branch = pr.get("base", {}).get("ref", "")
     print(f"- #{pr['number']} {pr['title']} [{pr['state']}] by {pr['user']['login']} on {created.date()} {conflicted} {drafted}")
     print(f"  {pr.get('html_url')}")
+    if tgt_branch:
+        print(f"  base: {tgt_branch}")
 
     if extended:
         # labels
@@ -642,7 +678,6 @@ def print_pr_item(pr: Dict, owner: str, repo: str, extended: bool = False, membe
 
         # branch
         src_branch = pr.get("head", {}).get("ref", "")
-        tgt_branch = pr.get("base", {}).get("ref", "")
         if src_branch or tgt_branch:
             print(f"  branch: {src_branch} -> {tgt_branch}")
 
@@ -715,6 +750,7 @@ def handle_list_pr(args, client: GiteeClient):
     """
     # authors resolution
     authors: List[str] = []
+    use_default_listing = not args.file and not args.user and not args.repos
     if args.file:
         file_path = args.file if os.path.exists(args.file) else os.path.join(os.path.dirname(__file__), "members.txt")
         if not os.path.isfile(file_path):
@@ -725,14 +761,15 @@ def handle_list_pr(args, client: GiteeClient):
     elif args.user:
         authors = [args.user]
     else:
-        # default behavior: try members.txt, else git user
         file_path = client.members
         if os.path.isfile(file_path):
             print("ℹ️ No user specified. Using members.txt by default.")
             with open(file_path, "r", encoding="utf-8") as f:
                 authors = [line.strip() for line in f if line.strip()]
+        elif use_default_listing:
+            print("ℹ️ No user or members file specified. Showing PRs for all authors.")
         else:
-            print("ℹ️ No members file found. Trying to get usename from git.")
+            print("ℹ️ No members file found. Trying to get username from git.")
             try:
                 default_user = subprocess.check_output(["git", "config", "user.name"], text=True).strip()
             except Exception:
@@ -743,19 +780,23 @@ def handle_list_pr(args, client: GiteeClient):
     # repos resolution
     repos = args.repos.split(",") if args.repos else []
     if not repos:
-        repo_info = detect_git_repo()
-        if repo_info and repo_info[0]:
-            owner, repo, _ = repo_info
-            original = client.get_original_repo(owner, repo)
-            if original:
-                print(f"ℹ️ Используется оригинальный репозиторий: {original} (обнаружен из {owner}/{repo})")
-                repos = [original]
-            else:
-                print(f"ℹ️ Repository not specified. Using current repo: {owner}/{repo}")
-                repos = [f"{owner}/{repo}"]
+        if use_default_listing:
+            print(f"ℹ️ Repository not specified. Using default: {DEFAULT_LIST_PR_REPO}")
+            repos = [DEFAULT_LIST_PR_REPO]
         else:
-            print("ℹ️ Repository not specified. Using default: openharmony/arkui_ace_engine")
-            repos = ["openharmony/arkui_ace_engine"]
+            repo_info = detect_git_repo()
+            if repo_info and repo_info[0]:
+                owner, repo, _ = repo_info
+                original = client.get_original_repo(owner, repo)
+                if original:
+                    print(f"ℹ️ Используется оригинальный репозиторий: {original} (обнаружен из {owner}/{repo})")
+                    repos = [original]
+                else:
+                    print(f"ℹ️ Repository not specified. Using current repo: {owner}/{repo}")
+                    repos = [f"{owner}/{repo}"]
+            else:
+                print(f"ℹ️ Repository not specified. Using default: {DEFAULT_LIST_PR_REPO}")
+                repos = [DEFAULT_LIST_PR_REPO]
     else:
         # репозитории заданы явно пользователем — просто нормализуем список
         repos = [r.strip() for r in repos if r.strip()]
@@ -764,6 +805,7 @@ def handle_list_pr(args, client: GiteeClient):
     # 🆕 по умолчанию открытые PR
     state = args.state or ("all" if args.all else "open")
     include_draft = bool(args.include_draft)
+    limit = args.limit  # 0 = без ограничения
     since_date = None
     if args.since:
         try:
@@ -773,61 +815,82 @@ def handle_list_pr(args, client: GiteeClient):
             return
 
     # build tasks: for each (repo, author) fetch PRs in parallel
-    tasks = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_meta = {}
-        for repo_full in repos:
-            owner, repo = repo_full.strip().split("/")
-            # get owners
-            owner_config = get_owner_config(client, owner, repo)  # 🔹 загрузить и закэшировать
+    repo_grouped_results: Dict[str, List[Dict]] = {}
+    owner_configs: Dict[str, Dict] = {}
+    with _Spinner("Fetching PRs…") as spinner:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_meta = {}
+            for repo_full in repos:
+                owner, repo = repo_full.strip().split("/")
+                owner_configs[repo_full.strip()] = get_owner_config(client, owner, repo)
+                requested_authors = authors or [None]
+                for author in requested_authors:
+                    fut = executor.submit(client.list_pull_requests, owner, repo, state, author, 50, limit)
+                    future_to_meta[fut] = (owner, repo, author)
+
+            for fut in as_completed(future_to_meta):
+                owner, repo, author = future_to_meta[fut]
+                try:
+                    prs = fut.result()
+                except Exception as e:
+                    print(f"❌ Error fetching PRs for {owner}/{repo} author={author}: {e}")
+                    prs = []
+                prs = filter_pull_requests(prs, include_draft, since_date)
+                key = f"{owner}/{repo}"
+                repo_grouped_results.setdefault(key, []).extend(prs)
+
+        # Apply sort + limit before fetching details (so we only detail-fetch what we show)
+        for repo_key in list(repo_grouped_results):
+            prs = repo_grouped_results[repo_key]
+            prs.sort(key=lambda p: p.get("created_at", ""), reverse=True)
+            if limit > 0:
+                prs = prs[:limit]
+            repo_grouped_results[repo_key] = prs
+
+        # Fetch conflict state for visible PRs in parallel
+        detail_tasks = [
+            (owner_r, repo_r, pr)
+            for repo_full, prs in repo_grouped_results.items()
+            for owner_r, repo_r in [repo_full.split("/")]
+            for pr in prs
+        ]
+        if detail_tasks:
+            spinner.update(f"Fetching conflict state for {len(detail_tasks)} PRs…")
+
+            def _fetch_conflict(task):
+                o, r, pr = task
+                detailed = client.get_single_pull_request(o, r, pr["number"])
+                if detailed and "mergeable_state" in detailed:
+                    pr["conflict_passed"] = detailed["mergeable_state"].get("conflict_passed", False)
+
+            with ThreadPoolExecutor(max_workers=8) as detail_executor:
+                list(detail_executor.map(_fetch_conflict, detail_tasks))
+
+    # printing behavior: group_by_user => print grouped by user else print combined list
+    for repo_full in repos:
+        repo_key = repo_full.strip()
+        owner_config = owner_configs.get(repo_key, {})
+        repo_prs = repo_grouped_results.get(repo_key, [])
+
+        total_label = f" (показано {len(repo_prs)}" + (f" из ≥{limit}, --limit 0 для всех" if limit > 0 and len(repo_prs) == limit else "") + ")"
+        print(f"\n📂 {repo_key}{total_label}")
+        if args.group_by_user or (args.user and not args.file):
+            # print per-author lists
             for author in authors:
-                fut = executor.submit(client.list_pull_requests, owner, repo, state, author)
-                future_to_meta[fut] = (owner, repo, author)
-
-        # collect and print
-        repo_grouped_results: Dict[str, List[Dict]] = {}
-        for fut in as_completed(future_to_meta):
-            owner, repo, author = future_to_meta[fut]
-            try:
-                prs = fut.result()
-            except Exception as e:
-                print(f"❌ Error fetching PRs for {owner}/{repo} author={author}: {e}")
-                prs = []
-            # filter locally
-            prs = filter_pull_requests(prs, include_draft, since_date)
-            key = f"{owner}/{repo}"
-            repo_grouped_results.setdefault(key, []).extend(prs)
-
-        for repo_full, prs in repo_grouped_results.items():
-            owner, repo = repo_full.split("/")
-            for pr in prs:
-                detailed_pr = client.get_single_pull_request(owner, repo, pr["number"])
-                if detailed_pr and "mergeable_state" in detailed_pr:
-                    pr["conflict_passed"] = detailed_pr["mergeable_state"].get("conflict_passed", False)
-
-        # printing behavior: group_by_user => print grouped by user else print combined list
-        for repo_full in repos:
-            repo_key = repo_full.strip()
-            print(f"\n📂 {repo_key}")
-            if args.group_by_user or (args.user and not args.file):
-                # print per-author lists
-                for author in authors:
-                    print(f"\n👤 Author: {author}")
-                    # find PRs in repo by that author
-                    author_prs = [p for p in repo_grouped_results.get(repo_key, []) if p.get("user", {}).get("login") == author]
-                    if not author_prs:
-                        print("ℹ️ No PRs for this author.")
-                        continue
-                    for pr in author_prs:
-                        print_pr_item(pr, *repo_key.split("/"), extended=args.extended_info, members_list=authors, owner_config=owner_config)
+                print(f"\n👤 Author: {author}")
+                author_prs = [p for p in repo_prs if p.get("user", {}).get("login") == author]
+                if not author_prs:
+                    print("ℹ️ No PRs for this author.")
+                    continue
+                for pr in author_prs:
+                    print_pr_item(pr, *repo_key.split("/"), extended=args.extended_info, members_list=authors, owner_config=owner_config)
+        else:
+            # print combined
+            if not repo_prs:
+                print("ℹ️ No PRs found.")
             else:
-                # print combined
-                all_prs = repo_grouped_results.get(repo_key, [])
-                if not all_prs:
-                    print("ℹ️ No PRs found.")
-                else:
-                    for pr in all_prs:
-                        print_pr_item(pr, *repo_key.split("/"), extended=args.extended_info, members_list=authors, owner_config=owner_config)
+                for pr in repo_prs:
+                    print_pr_item(pr, *repo_key.split("/"), extended=args.extended_info, members_list=authors, owner_config=owner_config)
 
 
 # --------------------------------------------------------------------
@@ -837,7 +900,7 @@ def handle_comment_pr(args, client: GiteeClient):
     owner = repo = pr_id = None
 
     if args.url:
-        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pulls?/(\d+)", args.url)
+        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/(?:pulls?|merge_requests)/(\d+)", args.url)
         if match:
             owner, repo, pr_id = match.groups()
         else:
@@ -849,7 +912,7 @@ def handle_comment_pr(args, client: GiteeClient):
     else:
         input_val = prompt("Enter pull request URL or owner/repo > ")
         if input_val.startswith("http"):
-            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/pulls?/(\d+)", input_val)
+            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/(?:pulls?|merge_requests)/(\d+)", input_val)
             if match:
                 owner, repo, pr_id = match.groups()
             else:
@@ -969,7 +1032,7 @@ def handle_create_issue_and_pr(args, client: GiteeClient):
 def handle_show_comments(args, client: GiteeClient):
     owner = repo = pr_id = None
     if args.url:
-        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pulls?/(\d+)", args.url)
+        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/(?:pulls?|merge_requests)/(\d+)", args.url)
         if match:
             owner, repo, pr_id = match.groups()
         else:
@@ -982,7 +1045,7 @@ def handle_show_comments(args, client: GiteeClient):
         # Интерактивный ввод
         input_val = prompt("Enter pull request URL or owner/repo > ")
         if input_val.startswith("http"):
-            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/pulls?/(\d+)", input_val)
+            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/(?:pulls?|merge_requests)/(\d+)", input_val)
             if match:
                 owner, repo, pr_id = match.groups()
             else:
@@ -1106,6 +1169,8 @@ def main():
     p_list.add_argument("--all", action="store_true", help="Показать все PR вне зависимости от состояния")
     p_list.add_argument("--include-draft", action="store_true", help="Включать черновики (draft)")
     p_list.add_argument("--since", help="Выводить PR, созданные после даты YYYY-MM-DD")
+    p_list.add_argument("--limit", type=int, default=30, metavar="N",
+                        help="Показать не более N самых новых PR (по дате создания). 0 = без ограничения. По умолчанию: 30.")
     p_list.add_argument("--group-by-user", action="store_true", help="Группировать вывод по пользователям")
     p_list.add_argument("--extended-info", action="store_true", help="Показывать расширенную информацию (labels, reviewers, code owners, testers)")
 
@@ -1150,8 +1215,8 @@ def main():
     except argparse.ArgumentError as error:
         arg_parser.print_help()
         arg_parser.error(str(error))
-    base_url, token, members = load_config()
-    client = GiteeClient(base_url, token, members)
+    base_url, token, members, config_path = load_config()
+    client = GiteeClient(base_url, token, members, config_path)
 
     if args.command == "create-issue":
         handle_create_issue(args, client)
