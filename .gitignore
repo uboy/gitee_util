@@ -28,3 +28,7 @@ members.txt
 /build/gitcode_util/xref-gitcode_util.html
 /build/gitcode_util/PYZ-00.pyz
 __pycache__
+.agent-memory/
+.codex
+.scratchpad/
+coordination/
