@@ -220,7 +220,7 @@ class GiteeClient:
         data = {
             "title": title,
             "body": body,
-            "labels": ', '.join(labels),
+            "labels": labels,
             "repo": repo
         }
         r = self.safe_request("POST", url, json=data)
@@ -416,10 +416,6 @@ def prepare_issue_data(args, client: GiteeClient) -> Optional[Dict]:
         print(f"❌ Repository {owner}/{repo} not found or inaccessible.")
         return None
 
-    if not client.validate_repository(owner, repo):
-        print(f"❌ Repository {owner}/{repo} not found or inaccessible.")
-        return None
-
     # title
     title = args.title or prompt("Issue Title > ")
 
@@ -441,7 +437,7 @@ def prepare_issue_data(args, client: GiteeClient) -> Optional[Dict]:
     wanted = "bug" if args.type == "bug" else "enhancement"
     #found_label = next((lbl for lbl in existing_labels if lbl.lower() == wanted), None)
     #labels = [found_label] if found_label else []
-    labels = wanted
+    labels = [wanted]
 
     return {
         "owner": owner,
@@ -841,7 +837,7 @@ def handle_comment_pr(args, client: GiteeClient):
     owner = repo = pr_id = None
 
     if args.url:
-        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pull/(\d+)", args.url)
+        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pulls?/(\d+)", args.url)
         if match:
             owner, repo, pr_id = match.groups()
         else:
@@ -853,7 +849,7 @@ def handle_comment_pr(args, client: GiteeClient):
     else:
         input_val = prompt("Enter pull request URL or owner/repo > ")
         if input_val.startswith("http"):
-            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/pull/(\d+)", input_val)
+            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/pulls?/(\d+)", input_val)
             if match:
                 owner, repo, pr_id = match.groups()
             else:
@@ -886,8 +882,7 @@ def handle_create_issue(args, client: GiteeClient):
     print("-" * 60)
     print(issue_data["body"][:1000])
     print("-" * 60)
-    confirm = prompt("Create issue? (yes/no) > ")
-    if confirm.lower().startswith("y"):
+    if getattr(args, 'yes', False) or prompt("Create issue? (yes/no) > ").lower().startswith("y"):
         res = client.create_issue(issue_data["owner"], issue_data["repo"], issue_data["title"], issue_data["body"], issue_data["labels"])
         if res:
             print("✅ Issue created:", res.get("html_url"))
@@ -904,8 +899,7 @@ def handle_create_pr(args, client: GiteeClient):
     print("-" * 60)
     print(pr_data["body"][:1000])
     print("-" * 60)
-    confirm = prompt("Create PR? (yes/no) > ")
-    if confirm.lower().startswith("y"):
+    if getattr(args, 'yes', False) or prompt("Create PR? (yes/no) > ").lower().startswith("y"):
         res = client.create_pull_request(pr_data["tgt_owner"], pr_data["tgt_repo"], pr_data["title"], pr_data["body"], pr_data["head"], pr_data["base"])
         if res:
             print("✅ PR created:", res.get("html_url"))
@@ -933,8 +927,7 @@ def handle_create_issue_and_pr(args, client: GiteeClient):
     print("-" * 60)
     print(pr_data["body"][:1000])
     print("-" * 60)
-    confirm = prompt("Create issue and PR sequentially? (yes/no) > ")
-    if not confirm.lower().startswith("y"):
+    if not (getattr(args, 'yes', False) or prompt("Create issue and PR sequentially? (yes/no) > ").lower().startswith("y")):
         print("❌ Aborted by user.")
         return
 
@@ -976,7 +969,7 @@ def handle_create_issue_and_pr(args, client: GiteeClient):
 def handle_show_comments(args, client: GiteeClient):
     owner = repo = pr_id = None
     if args.url:
-        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pulls/(\d+)", args.url)
+        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/pulls?/(\d+)", args.url)
         if match:
             owner, repo, pr_id = match.groups()
         else:
@@ -989,7 +982,7 @@ def handle_show_comments(args, client: GiteeClient):
         # Интерактивный ввод
         input_val = prompt("Enter pull request URL or owner/repo > ")
         if input_val.startswith("http"):
-            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/pulls/(\d+)", input_val)
+            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/pulls?/(\d+)", input_val)
             if match:
                 owner, repo, pr_id = match.groups()
             else:
@@ -1055,6 +1048,7 @@ def main():
     p_issue.add_argument("--type", choices=["bug", "feature"], required=True, help="Тип задачи")
     p_issue.add_argument("--title", help="Заголовок Issue")
     p_issue.add_argument("--desc-file", help="Файл с описанием Issue")
+    p_issue.add_argument("--yes", "-y", action="store_true", help="Не запрашивать подтверждение")
 
     # ===== create-pr =====
     p_pr = subparsers.add_parser(
@@ -1072,6 +1066,7 @@ def main():
     p_pr.add_argument("--repo", help="Репозиторий назначения (owner/repo)")
     p_pr.add_argument("--base", default="master", help="Целевая ветка (по умолчанию master)")
     p_pr.add_argument("--desc-file", help="Файл с описанием PR")
+    p_pr.add_argument("--yes", "-y", action="store_true", help="Не запрашивать подтверждение")
 
     # ===== comment-pr =====
     p_cmt = subparsers.add_parser(
@@ -1132,6 +1127,7 @@ def main():
     p_both.add_argument("--title", help="Заголовок")
     p_both.add_argument("--desc-file", help="Файл с описанием")
     p_both.add_argument("--base", default="master", help="Целевая ветка PR (по умолчанию master)")
+    p_both.add_argument("--yes", "-y", action="store_true", help="Не запрашивать подтверждение")
 
     # ===== show-comments =====
     p_show = subparsers.add_parser(

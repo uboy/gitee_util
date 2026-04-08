@@ -27,3 +27,4 @@ members.txt
 /build/gitcode_util/warn-gitcode_util.txt
 /build/gitcode_util/xref-gitcode_util.html
 /build/gitcode_util/PYZ-00.pyz
+__pycache__
