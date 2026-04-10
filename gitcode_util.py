@@ -135,9 +135,9 @@ class GiteeClient:
         # base_url like "https://gitcode.com"
         self.api_base = f"{base_url}/api/v5"
         self.session = requests.Session()
-        # use access_token param to be compatible with Gitcode API v5
         self.has_token = bool((token or "").strip())
-        self.session.params = {"access_token": token} if self.has_token else {}
+        if self.has_token:
+            self.session.headers["private-token"] = token
         # members file
         self.members = members
         self.config_path = config_path
@@ -161,7 +161,7 @@ class GiteeClient:
                 refreshed_token = maybe_refresh_provider_token("gitcode", self.config_path)
                 if refreshed_token:
                     self.has_token = True
-                    self.session.params = {"access_token": refreshed_token}
+                    self.session.headers["private-token"] = refreshed_token
                     return self.safe_request(method, url, **kwargs)
             print(f"❌ Gitcode API error: {status}\n{text}\n{url}")
             return None

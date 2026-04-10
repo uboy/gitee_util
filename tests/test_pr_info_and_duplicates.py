@@ -182,6 +182,18 @@ class PrInfoAndDuplicateTests(unittest.TestCase):
                 self.assertNotIn("token setup is required", rendered.lower())
                 self.assertNotEqual(rc, 1)
 
+    def test_gitcode_client_uses_private_token_header_when_token_exists(self):
+        client = gitcode_util.GiteeClient(
+            "https://gitcode.com",
+            "secret-token",
+            "/tmp/members.txt",
+            "/tmp/config.ini",
+        )
+
+        self.assertTrue(client.has_token)
+        self.assertEqual(client.session.headers.get("private-token"), "secret-token")
+        self.assertNotIn("access_token", client.session.params)
+
 
 if __name__ == "__main__":
     unittest.main()
