@@ -303,6 +303,26 @@ class GiteeClient:
             page += 1
         return collected
 
+    def list_issues(self, owner: str, repo: str, state: str = "open", per_page: int = 50, max_results: int = 100) -> List[Dict]:
+        collected = []
+        page = 1
+        fetch_size = per_page if max_results == 0 else min(per_page, max_results)
+        while True:
+            url = f"{self.api_base}/repos/{owner}/{repo}/issues?state={state}&per_page={fetch_size}&page={page}"
+            r = self.safe_request("GET", url)
+            if r is None:
+                break
+            page_data = r.json()
+            if not page_data:
+                break
+            collected.extend(page_data)
+            if max_results > 0 and len(collected) >= max_results:
+                break
+            if len(page_data) < fetch_size:
+                break
+            page += 1
+        return collected
+
     def comment_pull_request(self, owner: str, repo: str, pr_number: int, comment: str) -> Optional[Dict]:
         url = f"{self.api_base}/repos/{owner}/{repo}/pulls/{pr_number}/comments"
         data = {"body": comment}
@@ -323,6 +343,13 @@ class GiteeClient:
 
     def get_pull_request_comments(self, owner: str, repo: str, pr_id: int) -> List[Dict]:
         url = f"{self.api_base}/repos/{owner}/{repo}/pulls/{pr_id}/comments"
+        r = self.safe_request("GET", url)
+        if r is None:
+            return []
+        return r.json()
+
+    def get_pull_request_files(self, owner: str, repo: str, pr_id: int) -> List[Dict]:
+        url = f"{self.api_base}/repos/{owner}/{repo}/pulls/{pr_id}/files"
         r = self.safe_request("GET", url)
         if r is None:
             return []
@@ -411,6 +438,155 @@ def translate_question(ch: str) -> str:
         "该需求带来的价值、应用场景？": "Value and application scenario of this feature?"
     }
     return translations.get(ch.strip(), ch)
+
+
+def normalize_title(text: str) -> str:
+    return " ".join((text or "").split()).strip().casefold()
+
+
+def resolve_pr_coordinates(args) -> Optional[Dict[str, str]]:
+    owner = repo = pr_id = None
+    if args.url:
+        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/(?:pulls?|merge_requests)/(\d+)", args.url)
+        if match:
+            owner, repo, pr_id = match.groups()
+        else:
+            print("❌ Invalid pull request URL format.")
+            return None
+    elif getattr(args, "repo", None) and getattr(args, "pr_id", None):
+        owner, repo = args.repo.split("/")
+        pr_id = args.pr_id
+    else:
+        input_val = prompt("Enter pull request URL or owner/repo > ")
+        if input_val.startswith("http"):
+            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/(?:pulls?|merge_requests)/(\d+)", input_val)
+            if match:
+                owner, repo, pr_id = match.groups()
+            else:
+                print("❌ Invalid pull request URL format.")
+                return None
+        elif "/" in input_val:
+            owner, repo = input_val.split("/")
+            pr_id = prompt("Enter pull request ID > ")
+        else:
+            print("❌ Invalid input. Expected a URL or owner/repo format.")
+            return None
+    return {"owner": owner, "repo": repo, "pr_id": pr_id}
+
+
+def find_duplicate_issue(client: GiteeClient, owner: str, repo: str, title: str) -> Optional[Dict]:
+    wanted = normalize_title(title)
+    if not wanted:
+        return None
+    for issue in client.list_issues(owner, repo, state="open", max_results=100):
+        if normalize_title(issue.get("title", "")) == wanted:
+            return issue
+    return None
+
+
+def _head_repo_branch(head_spec: str) -> Dict[str, str]:
+    repo_full, _, branch = (head_spec or "").partition(":")
+    owner = repo_full.split("/", 1)[0] if "/" in repo_full else repo_full
+    return {"repo_full": repo_full, "owner": owner, "branch": branch}
+
+
+def is_duplicate_pull_request(pr: Dict, title: str, head: str, base: str) -> bool:
+    if normalize_title(pr.get("title", "")) == normalize_title(title):
+        return True
+
+    wanted = _head_repo_branch(head)
+    head_info = pr.get("head", {}) or {}
+    base_info = pr.get("base", {}) or {}
+    actual_branch = head_info.get("ref", "")
+    actual_base = base_info.get("ref", "")
+    if wanted["branch"] and actual_branch != wanted["branch"]:
+        return False
+    if base and actual_base != base:
+        return False
+
+    actual_repo_full = (head_info.get("repo", {}) or {}).get("full_name", "")
+    actual_owner = (head_info.get("user", {}) or {}).get("login", "")
+    actual_label = head_info.get("label", "")
+
+    if actual_repo_full and actual_repo_full == wanted["repo_full"]:
+        return True
+    if actual_owner and actual_owner == wanted["owner"]:
+        return True
+    if actual_label and actual_label.endswith(f":{wanted['branch']}"):
+        return True
+    return False
+
+
+def find_duplicate_pull_request(client: GiteeClient, owner: str, repo: str, title: str, head: str, base: str) -> Optional[Dict]:
+    for pr in client.list_pull_requests(owner, repo, state="open", max_results=100):
+        if is_duplicate_pull_request(pr, title, head, base):
+            return pr
+    return None
+
+
+def print_duplicate_match(kind: str, item: Dict):
+    number = item.get("number") or item.get("iid") or item.get("id") or "?"
+    title = item.get("title") or "(no title)"
+    url = item.get("html_url") or item.get("url") or ""
+    print(f"⚠️ Existing open {kind} looks like a duplicate:")
+    print(f"  #{number} {title}")
+    if url:
+        print(f"  {url}")
+    print("❌ Creation aborted. Reuse the existing item or pass --allow-duplicate.")
+
+
+def format_named_people(users: List[Dict], role_key: str = "", accept_key: str = "accept") -> str:
+    if role_key:
+        users = [u for u in users if u.get(role_key, False)]
+    if not users:
+        return "-"
+    rendered = []
+    for user in sorted(users, key=lambda u: u.get("login", "")):
+        login = user.get("login", "unknown")
+        if accept_key in user:
+            login = f"{login} ({'accepted' if user.get(accept_key) else 'pending'})"
+        rendered.append(login)
+    return ", ".join(rendered)
+
+
+def print_pull_request_details(pr: Dict, owner: str, repo: str, files: List[Dict]):
+    body = strip_html_tags(pr.get("body", "")) or "[empty]"
+    assignees = pr.get("assignees", []) or []
+    code_owners = [u for u in assignees if u.get("code_owner")]
+    reviewers = [u for u in assignees if u.get("assignee")]
+    testers = pr.get("testers", []) or []
+    labels = [lbl.get("name") for lbl in pr.get("labels", []) if lbl.get("name")]
+    head_ref = (pr.get("head", {}) or {}).get("ref", "-")
+    base_ref = (pr.get("base", {}) or {}).get("ref", "-")
+    head_repo = ((pr.get("head", {}) or {}).get("repo", {}) or {}).get("full_name", "")
+    if head_repo:
+        head_ref = f"{head_repo}:{head_ref}"
+    print(f"PR #{pr.get('number', '?')} in {owner}/{repo}")
+    print(f"Title: {pr.get('title', '-')}")
+    print(f"State: {pr.get('state', '-')}")
+    print(f"URL: {pr.get('html_url', '-')}")
+    print(f"Author: {(pr.get('user', {}) or {}).get('login', '-')}")
+    print(f"Created: {pr.get('created_at', '-')}")
+    print(f"Updated: {pr.get('updated_at', '-')}")
+    print(f"Base: {base_ref}")
+    print(f"Head: {head_ref}")
+    print(f"Reviewers: {format_named_people(reviewers, accept_key='accept')}")
+    print(f"Code Owners: {format_named_people(code_owners, accept_key='accept')}")
+    print(f"Testers: {format_named_people(testers, accept_key='accept')}")
+    print(f"Labels: {', '.join(labels) if labels else '-'}")
+    print()
+    print("Description:")
+    print(body)
+    print()
+    print(f"Changed Files ({len(files)}):")
+    if not files:
+        print("- [not available]")
+        return
+    for item in files:
+        filename = item.get("filename") or item.get("new_path") or item.get("path") or item.get("old_path") or "[unknown]"
+        status = item.get("status") or item.get("change_type") or ""
+        suffix = f" [{status}]" if status else ""
+        print(f"- {filename}{suffix}")
 
 
 # --------------------------------------------------------------------
@@ -940,6 +1116,11 @@ def handle_create_issue(args, client: GiteeClient):
     issue_data = prepare_issue_data(args, client)
     if not issue_data:
         return
+    if not getattr(args, "allow_duplicate", False):
+        duplicate = find_duplicate_issue(client, issue_data["owner"], issue_data["repo"], issue_data["title"])
+        if duplicate:
+            print_duplicate_match("issue", duplicate)
+            return
     print("\n--- Preview ---")
     print(issue_data["title"])
     print("-" * 60)
@@ -957,6 +1138,18 @@ def handle_create_pr(args, client: GiteeClient):
     pr_data = prepare_pr_data(args, client)
     if not pr_data:
         return
+    if not getattr(args, "allow_duplicate", False):
+        duplicate = find_duplicate_pull_request(
+            client,
+            pr_data["tgt_owner"],
+            pr_data["tgt_repo"],
+            pr_data["title"],
+            pr_data["head"],
+            pr_data["base"],
+        )
+        if duplicate:
+            print_duplicate_match("pull request", duplicate)
+            return
     print("\n--- Preview ---")
     print(pr_data["title"])
     print("-" * 60)
@@ -978,6 +1171,22 @@ def handle_create_issue_and_pr(args, client: GiteeClient):
     pr_data = prepare_pr_data(args, client)
     if not pr_data:
         return
+    if not getattr(args, "allow_duplicate", False):
+        duplicate_issue = find_duplicate_issue(client, issue_data["owner"], issue_data["repo"], issue_data["title"])
+        if duplicate_issue:
+            print_duplicate_match("issue", duplicate_issue)
+            return
+        duplicate_pr = find_duplicate_pull_request(
+            client,
+            pr_data["tgt_owner"],
+            pr_data["tgt_repo"],
+            pr_data["title"],
+            pr_data["head"],
+            pr_data["base"],
+        )
+        if duplicate_pr:
+            print_duplicate_match("pull request", duplicate_pr)
+            return
 
     # Покажем предпросмотр и спросим подтверждение
     print("\n--- Preview Issue ---")
@@ -1030,34 +1239,12 @@ def handle_create_issue_and_pr(args, client: GiteeClient):
 # Show comments
 # --------------------------------------------------------------------
 def handle_show_comments(args, client: GiteeClient):
-    owner = repo = pr_id = None
-    if args.url:
-        match = re.match(r"https?://[^/]+/([^/]+)/([^/]+)/(?:pulls?|merge_requests)/(\d+)", args.url)
-        if match:
-            owner, repo, pr_id = match.groups()
-        else:
-            print("❌ Invalid pull request URL format.")
-            return
-    elif args.repo and args.pr_id:
-        owner, repo = args.repo.split("/")
-        pr_id = args.pr_id
-    else:
-        # Интерактивный ввод
-        input_val = prompt("Enter pull request URL or owner/repo > ")
-        if input_val.startswith("http"):
-            match = re.match(r"https?://gitcode\.com/([^/]+)/([^/]+)/(?:pulls?|merge_requests)/(\d+)", input_val)
-            if match:
-                owner, repo, pr_id = match.groups()
-            else:
-                print("❌ Invalid pull request URL format.")
-                return
-        elif "/" in input_val:
-            owner, repo = input_val.split("/")
-            pr_id = prompt("Enter pull request ID > ")
-        else:
-            print("❌ Invalid input. Expected a URL or owner/repo format.")
-            return
-
+    resolved = resolve_pr_coordinates(args)
+    if not resolved:
+        return
+    owner = resolved["owner"]
+    repo = resolved["repo"]
+    pr_id = resolved["pr_id"]
     comments = client.get_pull_request_comments(owner, repo, int(pr_id))
     if not comments:
         print("ℹ️ No comments found.")
@@ -1071,6 +1258,21 @@ def handle_show_comments(args, client: GiteeClient):
         print(f"--- {author} @ {date} ---")
         print(plain or "[empty]")
         print()
+
+
+def handle_show_pr(args, client: GiteeClient):
+    resolved = resolve_pr_coordinates(args)
+    if not resolved:
+        return
+    owner = resolved["owner"]
+    repo = resolved["repo"]
+    pr_id = resolved["pr_id"]
+    pr = client.get_single_pull_request(owner, repo, int(pr_id))
+    if not pr:
+        print("❌ Pull request not found.")
+        return
+    files = client.get_pull_request_files(owner, repo, int(pr_id))
+    print_pull_request_details(pr, owner, repo, files)
 
 
 # --------------------------------------------------------------------
@@ -1112,6 +1314,7 @@ def main():
     p_issue.add_argument("--title", help="Заголовок Issue")
     p_issue.add_argument("--desc-file", help="Файл с описанием Issue")
     p_issue.add_argument("--yes", "-y", action="store_true", help="Не запрашивать подтверждение")
+    p_issue.add_argument("--allow-duplicate", action="store_true", help="Разрешить создание даже при найденном открытом дубликате")
 
     # ===== create-pr =====
     p_pr = subparsers.add_parser(
@@ -1130,6 +1333,7 @@ def main():
     p_pr.add_argument("--base", default="master", help="Целевая ветка (по умолчанию master)")
     p_pr.add_argument("--desc-file", help="Файл с описанием PR")
     p_pr.add_argument("--yes", "-y", action="store_true", help="Не запрашивать подтверждение")
+    p_pr.add_argument("--allow-duplicate", action="store_true", help="Разрешить создание даже при найденном открытом дубликате")
 
     # ===== comment-pr =====
     p_cmt = subparsers.add_parser(
@@ -1193,6 +1397,22 @@ def main():
     p_both.add_argument("--desc-file", help="Файл с описанием")
     p_both.add_argument("--base", default="master", help="Целевая ветка PR (по умолчанию master)")
     p_both.add_argument("--yes", "-y", action="store_true", help="Не запрашивать подтверждение")
+    p_both.add_argument("--allow-duplicate", action="store_true", help="Разрешить создание даже при найденном открытом дубликате")
+
+    # ===== show-pr =====
+    p_show_pr = subparsers.add_parser(
+        "show-pr",
+        help="Показать подробную информацию по PR",
+        description="""Выводит карточку одного Pull Request с описанием, участниками и списком изменённых файлов.
+
+Примеры:
+  gitcode_util.py show-pr --repo owner/repo --pr-id 123
+  gitcode_util.py show-pr --url https://gitcode.com/owner/repo/pulls/123""",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    p_show_pr.add_argument("--url", help="Полный URL PR")
+    p_show_pr.add_argument("--repo", help="Репозиторий (owner/repo)")
+    p_show_pr.add_argument("--pr-id", help="ID PR")
 
     # ===== show-comments =====
     p_show = subparsers.add_parser(
@@ -1230,6 +1450,8 @@ def main():
         handle_create_issue_and_pr(args, client)
     elif args.command == "show-comments":
         handle_show_comments(args, client)
+    elif args.command == "show-pr":
+        handle_show_pr(args, client)
     else:
         arg_parser.print_help()
         return 1

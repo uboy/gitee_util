@@ -11,6 +11,7 @@
 - Создание Pull Request (`create-pr`)
 - Добавление комментария к PR (`comment-pr`)
 - Просмотр PR'ов (`list-pr`)
+- Просмотр одного PR с деталями (`show-pr`)
 - Просмотр комментариев к PR (`show-comments`)
 - Создание Issue и PR одной командой (`create-issue-pr`)
 - Вывод всех открытых PR для логинов из файла (`list-pr-members`)
@@ -63,6 +64,7 @@ python git_host_util.py --provider gitee create-pr --repo owner/repo --base mast
 - если `--desc-file` не указан, используется сообщение последнего коммита
 - если выполняется из git-репозитория, текущая ветка и репозиторий определяются автоматически
 - если пользователь не ввёл описание — используется шаблон `.gitee/PULL_REQUEST_TEMPLATE.zh-CN.md`
+- перед созданием проверяется открытый дубликат по точному заголовку или по той же source/base ветке
 
 ### 💬 Добавление комментария к PR
 ```bash
@@ -108,6 +110,20 @@ python git_host_util.py --provider gitee show-comments --repo owner/repo --pr-id
 - форматированный вывод всех комментариев (автор, дата, текст)
 - поддерживает такие же аргументы, как `list-pr`
 
+### 🔎 Просмотр одного PR
+```bash
+python git_host_util.py --provider gitee show-pr --url https://gitee.com/owner/repo/pulls/12345
+```
+или
+```bash
+python git_host_util.py --provider gitcode show-pr --repo owner/repo --pr-id 12345
+```
+- выводит:
+  - заголовок и описание
+  - автора, статус, URL, base/head
+  - reviewers, code owners, testers
+  - изменённые файлы
+
 ### 🚀 Создание Issue и PR одной командой
 ```bash
 python git_host_util.py --provider gitee create-issue-pr --repo owner/repo --type bug --base master --desc-file ./desc.md
@@ -115,6 +131,7 @@ python git_host_util.py --provider gitee create-issue-pr --repo owner/repo --typ
 - автоматически создаёт issue и PR
 - ссылка на issue добавляется в тело PR в строку `IssueNo:`
 - если в описании уже есть строка `IssueNo:` со ссылкой — будет предложено её заменить
+- перед созданием ищет открытые дубликаты issue и PR и останавливается, если они уже существуют
 
 ---
 
