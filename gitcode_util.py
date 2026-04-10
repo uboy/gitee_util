@@ -8,6 +8,7 @@ import requests
 import subprocess
 import base64
 import json
+import fnmatch
 from prompt_toolkit import prompt
 import re
 import html
@@ -118,6 +119,30 @@ def get_owner_config(client, owner: str, repo: str, ref: str = "master") -> Dict
         return {}
 
 
+def get_codeowners_text(client, owner: str, repo: str, ref: str = "master") -> str:
+    """Load .gitcode/CODEOWNERS with a small cache."""
+    cache_file = CACHE_DIR / f"codeowners_{owner}_{repo}_{ref}.txt"
+    max_age = 7 * 24 * 60 * 60
+
+    if cache_file.exists():
+        mtime = cache_file.stat().st_mtime
+        if (time.time() - mtime) < max_age:
+            try:
+                return cache_file.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+    content = client.get_file_from_repo(owner, repo, ".gitcode/CODEOWNERS", ref=ref)
+    if not content:
+        return ""
+
+    try:
+        cache_file.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+    return content
+
+
 def strip_html_tags(text: str) -> str:
     """Удаляет html-теги и приводит к читаемому виду"""
     if not text:
@@ -125,6 +150,101 @@ def strip_html_tags(text: str) -> str:
     text = html.unescape(text)
     soup = BeautifulSoup(text, "html.parser")
     return soup.get_text(separator="\n").strip()
+
+
+def normalize_owner_name(value: str) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        return ""
+    if normalized.startswith("@"):
+        normalized = normalized[1:]
+    if normalized.startswith(("http://", "https://")):
+        normalized = normalized.rstrip("/").split("/")[-1]
+    return normalized.strip()
+
+
+def build_owner_groups(owner_config: Optional[Dict]) -> Dict[str, List[str]]:
+    groups = (owner_config or {}).get("groups", {}) or {}
+    normalized: Dict[str, List[str]] = {}
+    for raw_group, raw_members in groups.items():
+        group_name = normalize_owner_name(str(raw_group))
+        if not group_name:
+            continue
+        members: List[str] = []
+        for raw_member in raw_members or []:
+            if isinstance(raw_member, str):
+                member_name = normalize_owner_name(raw_member)
+            elif isinstance(raw_member, dict):
+                member_name = normalize_owner_name(
+                    str(raw_member.get("login") or raw_member.get("name") or raw_member.get("user") or "")
+                )
+            else:
+                member_name = ""
+            if member_name:
+                members.append(member_name)
+        normalized[group_name] = sorted(dict.fromkeys(members))
+    return normalized
+
+
+def parse_codeowners_rules(codeowners_text: str) -> List[Dict[str, Any]]:
+    rules: List[Dict[str, Any]] = []
+    for raw_line in (codeowners_text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            continue
+        if "#" in line:
+            line = line.split("#", 1)[0].rstrip()
+            if not line:
+                continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        pattern = parts[0].lstrip("/")
+        owners = [normalize_owner_name(part) for part in parts[1:]]
+        owners = [owner for owner in owners if owner]
+        if owners:
+            rules.append({"pattern": pattern, "owners": owners})
+    return rules
+
+
+def codeowners_match(filename: str, pattern: str) -> bool:
+    file_path = (filename or "").lstrip("/")
+    normalized_pattern = (pattern or "").lstrip("/")
+    if not file_path or not normalized_pattern:
+        return False
+    if normalized_pattern.endswith("/"):
+        return file_path.startswith(normalized_pattern)
+    return file_path == normalized_pattern or fnmatch.fnmatch(file_path, normalized_pattern)
+
+
+def resolve_codeowners_for_files(files: List[Dict], codeowners_text: str) -> List[Dict[str, Any]]:
+    rules = parse_codeowners_rules(codeowners_text)
+    resolved: List[Dict[str, Any]] = []
+    for item in files or []:
+        filename = item.get("filename") or item.get("new_path") or item.get("path") or item.get("old_path") or "[unknown]"
+        matched_owners: List[str] = []
+        matched_pattern = ""
+        for rule in rules:
+            if codeowners_match(filename, rule["pattern"]):
+                matched_pattern = rule["pattern"]
+                matched_owners = rule["owners"]
+        resolved.append({
+            "filename": filename,
+            "pattern": matched_pattern,
+            "owners": matched_owners,
+        })
+    return resolved
+
+
+def format_member_list(members: List[str], limit: int = 12) -> str:
+    if not members:
+        return "-"
+    if len(members) <= limit:
+        return ", ".join(members)
+    visible = ", ".join(members[:limit])
+    return f"{visible}, ... (+{len(members) - limit} more)"
 
 
 # --------------------------------------------------------------------
@@ -555,7 +675,15 @@ def format_named_people(users: List[Dict], role_key: str = "", accept_key: str =
     return ", ".join(rendered)
 
 
-def print_pull_request_details(pr: Dict, owner: str, repo: str, files: List[Dict]):
+def print_pull_request_details(
+    pr: Dict,
+    owner: str,
+    repo: str,
+    files: List[Dict],
+    *,
+    owner_config: Optional[Dict] = None,
+    codeowners_text: str = "",
+):
     body = strip_html_tags(pr.get("body", "")) or "[empty]"
     assignees = pr.get("assignees", []) or []
     code_owners = [u for u in assignees if u.get("code_owner")]
@@ -580,6 +708,34 @@ def print_pull_request_details(pr: Dict, owner: str, repo: str, files: List[Dict
     print(f"Code Owners: {format_named_people(code_owners, accept_key='accept')}")
     print(f"Testers: {format_named_people(testers, accept_key='accept')}")
     print(f"Labels: {', '.join(labels) if labels else '-'}")
+    owner_groups = build_owner_groups(owner_config)
+    expanded_code_owner_groups = [
+        normalize_owner_name(user.get("login", ""))
+        for user in code_owners
+        if normalize_owner_name(user.get("login", "")) in owner_groups
+    ]
+    if expanded_code_owner_groups:
+        print("Code Owner Group Members:")
+        for group_name in sorted(dict.fromkeys(expanded_code_owner_groups)):
+            print(f"- {group_name}: {format_member_list(owner_groups[group_name])}")
+    matched_rules = resolve_codeowners_for_files(files, codeowners_text)
+    if matched_rules:
+        print("CODEOWNERS Matches:")
+        for match in matched_rules:
+            print(f"- {match['filename']}")
+            if match["owners"]:
+                print(f"  owners: {', '.join(match['owners'])}")
+                if match["pattern"]:
+                    print(f"  rule: {match['pattern']}")
+                expanded = [
+                    f"{group_name}: {format_member_list(owner_groups[group_name])}"
+                    for group_name in match["owners"]
+                    if group_name in owner_groups
+                ]
+                if expanded:
+                    print(f"  members: {'; '.join(expanded)}")
+            else:
+                print("  owners: -")
     print()
     print("Description:")
     print(body)
@@ -1278,7 +1434,17 @@ def handle_show_pr(args, client: GiteeClient):
         print("❌ Pull request not found.")
         return
     files = client.get_pull_request_files(owner, repo, int(pr_id))
-    print_pull_request_details(pr, owner, repo, files)
+    ref = ((pr.get("base", {}) or {}).get("ref") or "master").strip() or "master"
+    owner_config = get_owner_config(client, owner, repo, ref=ref)
+    codeowners_text = get_codeowners_text(client, owner, repo, ref=ref)
+    print_pull_request_details(
+        pr,
+        owner,
+        repo,
+        files,
+        owner_config=owner_config,
+        codeowners_text=codeowners_text,
+    )
 
 
 # --------------------------------------------------------------------

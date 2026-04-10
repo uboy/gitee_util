@@ -13,8 +13,8 @@ members.txt
 /build/gitee_util/PYZ-00.toc
 /build/gitee_util/warn-gitee_util.txt
 /build/gitee_util/xref-gitee_util.html
-/.cache/owner_config_openharmony_arkui_ace_engine_master.json
-/dist/.cache/owner_config_openharmony_arkui_ace_engine_master.json
+/.cache/
+/dist/.cache/
 /build/gitcode_util/Analysis-00.toc
 /build/gitcode_util/base_library.zip
 /members.txt.bak

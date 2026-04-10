@@ -88,6 +88,21 @@ class _FakeClient:
             {"filename": "test/xts/acts/bar.ets", "status": "added"},
         ]
 
+    def get_file_from_repo(self, owner, repo, path, ref="master"):
+        if path.endswith("owner_config.json"):
+            return """{
+  "groups": {
+    "owner1": ["member_a", "member_b"],
+    "reviewer1": ["reviewer_member"]
+  }
+}"""
+        if path.endswith("CODEOWNERS"):
+            return """
+foundation/arkui/ace_engine/foo.cpp @owner1
+test/xts/acts/bar.ets @reviewer1 @owner1
+""".strip()
+        return None
+
 
 class PrInfoAndDuplicateTests(unittest.TestCase):
     def setUp(self):
@@ -109,6 +124,12 @@ class PrInfoAndDuplicateTests(unittest.TestCase):
                 self.assertIn("Improve chip behavior", rendered)
                 self.assertIn("Reviewers: reviewer1 (accepted)", rendered)
                 self.assertIn("Code Owners: owner1 (pending)", rendered)
+                self.assertIn("Code Owner Group Members:", rendered)
+                self.assertIn("- owner1: member_a, member_b", rendered)
+                self.assertIn("CODEOWNERS Matches:", rendered)
+                self.assertIn("foundation/arkui/ace_engine/foo.cpp", rendered)
+                self.assertIn("owners: owner1", rendered)
+                self.assertIn("members: owner1: member_a, member_b", rendered)
                 self.assertIn("Changed Files (2):", rendered)
                 self.assertIn("foundation/arkui/ace_engine/foo.cpp [modified]", rendered)
 
@@ -167,6 +188,9 @@ class PrInfoAndDuplicateTests(unittest.TestCase):
             def get_pull_request_files(self, owner, repo, pr_id):
                 return _FakeClient().get_pull_request_files(owner, repo, pr_id)
 
+            def get_file_from_repo(self, owner, repo, path, ref="master"):
+                return _FakeClient().get_file_from_repo(owner, repo, path, ref=ref)
+
         for module in (gitcode_util, gitee_util):
             with self.subTest(module=module.__name__):
                 output = io.StringIO()
@@ -179,6 +203,7 @@ class PrInfoAndDuplicateTests(unittest.TestCase):
                 rendered = output.getvalue()
                 self.assertIn("PR #55 in owner/repo", rendered)
                 self.assertIn("Improve chip behavior", rendered)
+                self.assertIn("Code Owner Group Members:", rendered)
                 self.assertNotIn("token setup is required", rendered.lower())
                 self.assertNotEqual(rc, 1)
 
