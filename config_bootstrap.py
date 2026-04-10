@@ -166,6 +166,22 @@ def ensure_provider_config(provider: str) -> tuple[str, str, str, str]:
     return base_url, token, _members_path(members), str(config_path)
 
 
+def read_provider_runtime_config(provider: str) -> tuple[str, str, str, str]:
+    meta = PROVIDER_META[provider]
+    config_path = _config_path()
+    config = _load_config(config_path)
+    _ensure_default_layout(config)
+
+    base_url = config.get(meta.section, meta.base_url_key, fallback=meta.default_url).strip() or meta.default_url
+    token = config.get(meta.section, "token", fallback="").strip()
+    members = config.get(meta.section, "members", fallback="members.txt").strip() or "members.txt"
+
+    if _is_placeholder_token(token):
+        token = ""
+
+    return base_url, token, _members_path(members), str(config_path)
+
+
 def maybe_refresh_provider_token(provider: str, config_path_value: str) -> Optional[str]:
     meta = PROVIDER_META[provider]
     config_path = Path(config_path_value)

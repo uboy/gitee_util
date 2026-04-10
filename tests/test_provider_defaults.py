@@ -74,6 +74,17 @@ class ProviderDefaultsTest(unittest.TestCase):
 
             self.assertEqual(provider, "gitcode")
 
+    def test_read_provider_runtime_config_uses_defaults_without_prompting(self):
+        with TemporaryDirectory() as tempdir:
+            os.environ["XDG_CONFIG_HOME"] = tempdir
+
+            base_url, token, members, returned_path = config_bootstrap.read_provider_runtime_config("gitcode")
+
+            self.assertEqual(base_url, "https://gitcode.com")
+            self.assertEqual(token, "")
+            self.assertTrue(members.endswith("members.txt"))
+            self.assertEqual(returned_path, str(Path(tempdir) / "gitee_util" / "config.ini"))
+
 
 if __name__ == "__main__":
     unittest.main()

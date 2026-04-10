@@ -22,7 +22,7 @@ import threading
 import itertools
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from config_bootstrap import ensure_provider_config, maybe_refresh_provider_token
+from config_bootstrap import ensure_provider_config, maybe_refresh_provider_token, read_provider_runtime_config
 
 # see https://gitee.com/api/v5/swagger
 # test link https://gitee.com/api/v5/repos/openharmony/arkui_ace_engine/pulls?base=OpenHarmony_feature_20250702&state=open&id=69593
@@ -84,6 +84,10 @@ def load_config():
     return ensure_provider_config("gitee")
 
 
+def load_runtime_config():
+    return read_provider_runtime_config("gitee")
+
+
 def get_owner_config(client, owner: str, repo: str, ref: str = "master") -> Dict:
     """
     Загружает owner_config.json с кэшированием на неделю.
@@ -132,7 +136,8 @@ class GiteeClient:
         self.api_base = f"{base_url}/api/v5"
         self.session = requests.Session()
         # use access_token param to be compatible with Gitee API v5
-        self.session.params = {"access_token": token}
+        self.has_token = bool((token or "").strip())
+        self.session.params = {"access_token": token} if self.has_token else {}
         # members file
         self.members = members
         self.config_path = config_path
@@ -151,10 +156,11 @@ class GiteeClient:
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
             text = getattr(e.response, "text", "")
-            if status in (401, 403) and not self._auth_retry_used:
+            if status in (401, 403) and self.has_token and not self._auth_retry_used:
                 self._auth_retry_used = True
                 refreshed_token = maybe_refresh_provider_token("gitee", self.config_path)
                 if refreshed_token:
+                    self.has_token = True
                     self.session.params = {"access_token": refreshed_token}
                     return self.safe_request(method, url, **kwargs)
             print(f"❌ Gitee API error: {status}\n{text}")
@@ -1394,7 +1400,13 @@ def main():
     except argparse.ArgumentError as error:
         arg_parser.print_help()
         arg_parser.error(str(error))
-    base_url, token, members, config_path = load_config()
+    if not args.command:
+        arg_parser.print_help()
+        return 1
+    if args.command in {"show-comments", "show-pr"}:
+        base_url, token, members, config_path = load_runtime_config()
+    else:
+        base_url, token, members, config_path = load_config()
     client = GiteeClient(base_url, token, members, config_path)
 
     if args.command == "create-issue":

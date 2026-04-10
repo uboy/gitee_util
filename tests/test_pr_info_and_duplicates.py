@@ -153,6 +153,35 @@ class PrInfoAndDuplicateTests(unittest.TestCase):
                 self.assertIn("https://example.invalid/pr/42", rendered)
                 self.assertEqual(client.pr_creates, 0)
 
+    def test_show_pr_main_uses_runtime_config_without_token_bootstrap(self):
+        class _ReadOnlyClient:
+            def __init__(self, base_url, token, members, config_path):
+                self.base_url = base_url
+                self.token = token
+                self.members = members
+                self.config_path = config_path
+
+            def get_single_pull_request(self, owner, repo, pr_id):
+                return _FakeClient().get_single_pull_request(owner, repo, pr_id)
+
+            def get_pull_request_files(self, owner, repo, pr_id):
+                return _FakeClient().get_pull_request_files(owner, repo, pr_id)
+
+        for module in (gitcode_util, gitee_util):
+            with self.subTest(module=module.__name__):
+                output = io.StringIO()
+                with patch.object(module, "load_config", side_effect=AssertionError("token bootstrap must not run")):
+                    with patch.object(module, "load_runtime_config", return_value=("https://example.invalid", "", "/tmp/members.txt", "/tmp/config.ini")):
+                        with patch.object(module, "GiteeClient", _ReadOnlyClient):
+                            with patch.object(sys, "argv", ["tool", "show-pr", "--url", "https://gitcode.com/owner/repo/pull/55"]):
+                                with redirect_stdout(output):
+                                    rc = module.main()
+                rendered = output.getvalue()
+                self.assertIn("PR #55 in owner/repo", rendered)
+                self.assertIn("Improve chip behavior", rendered)
+                self.assertNotIn("token setup is required", rendered.lower())
+                self.assertNotEqual(rc, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
